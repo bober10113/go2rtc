@@ -15,6 +15,10 @@ type API struct {
 	Token     string
 	ExpiresAt time.Time
 
+	ClientID     string
+	ClientSecret string
+	RefreshToken string
+
 	StreamProjectID string
 	StreamDeviceID  string
 	StreamExpiresAt time.Time
@@ -25,8 +29,9 @@ type API struct {
 	// RTSP
 	StreamToken          string
 	StreamExtensionToken string
-
-	extendTimer *time.Timer
+	extendMu             sync.Mutex
+	extendTimer          *time.Timer
+	extendStop           chan struct{}
 }
 
 type Auth struct {
@@ -42,6 +47,37 @@ type DeviceInfo struct {
 var cache = map[string]*API{}
 var cacheMu sync.Mutex
 
+// commandMu serializes Google SDM executeCommand calls.
+// This avoids several Nest cameras generating/extending/stopping at the same instant.
+var commandMu sync.Mutex
+
+func doNestRequest(client *http.Client, req *http.Request) (*http.Response, error) {
+	commandMu.Lock()
+	defer commandMu.Unlock()
+	return client.Do(req)
+}
+
+func (a *API) CloneForStream() *API {
+	return &API{
+		Token:        a.Token,
+		ExpiresAt:    a.ExpiresAt,
+		ClientID:     a.ClientID,
+		ClientSecret: a.ClientSecret,
+		RefreshToken: a.RefreshToken,
+	}
+}
+
+func nestJitter(deviceID string, max time.Duration) time.Duration {
+	if max <= 0 {
+		return 0
+	}
+	var n int64
+	for _, ch := range deviceID {
+		n += int64(ch)
+	}
+	return time.Duration(n % int64(max))
+}
+
 func NewAPI(clientID, clientSecret, refreshToken string) (*API, error) {
 	cacheMu.Lock()
 	defer cacheMu.Unlock()
@@ -50,7 +86,7 @@ func NewAPI(clientID, clientSecret, refreshToken string) (*API, error) {
 	now := time.Now()
 
 	if api := cache[key]; api != nil && now.Before(api.ExpiresAt) {
-		return api, nil
+		return api.CloneForStream(), nil
 	}
 
 	data := url.Values{
@@ -83,13 +119,16 @@ func NewAPI(clientID, clientSecret, refreshToken string) (*API, error) {
 	}
 
 	api := &API{
-		Token:     resv.AccessToken,
-		ExpiresAt: now.Add(resv.ExpiresIn * time.Second),
+		Token:        resv.AccessToken,
+		ExpiresAt:    now.Add(resv.ExpiresIn * time.Second),
+		ClientID:     clientID,
+		ClientSecret: clientSecret,
+		RefreshToken: refreshToken,
 	}
 
 	cache[key] = api
 
-	return api, nil
+	return api.CloneForStream(), nil
 }
 
 func (a *API) GetDevices(projectID string) ([]DeviceInfo, error) {
@@ -102,7 +141,7 @@ func (a *API) GetDevices(projectID string) ([]DeviceInfo, error) {
 	req.Header.Set("Authorization", "Bearer "+a.Token)
 
 	client := &http.Client{Timeout: time.Second * 5000}
-	res, err := client.Do(req)
+	res, err := doNestRequest(client, req)
 	if err != nil {
 		return nil, err
 	}
@@ -179,29 +218,34 @@ func (a *API) ExchangeSDP(projectID, deviceID, offer string) (string, error) {
 		req.Header.Set("Authorization", "Bearer "+a.Token)
 
 		client := &http.Client{Timeout: time.Second * 5000}
-		res, err := client.Do(req)
+		res, err := doNestRequest(client, req)
 		if err != nil {
 			return "", err
 		}
 
-		// Handle 409 (Conflict), 429 (Too Many Requests), and 401 (Unauthorized)
-		if res.StatusCode == 409 || res.StatusCode == 429 || res.StatusCode == 401 {
+		switch res.StatusCode {
+		case http.StatusUnauthorized:
 			res.Body.Close()
 			if attempt < maxRetries-1 {
-				// Get new token from Google
 				if err := a.refreshToken(); err != nil {
 					return "", err
 				}
+				time.Sleep(time.Second)
+				continue
+			}
+		case http.StatusConflict, http.StatusTooManyRequests:
+			res.Body.Close()
+			if attempt < maxRetries-1 {
 				time.Sleep(retryDelay)
-				retryDelay *= 2 // exponential backoff
+				retryDelay *= 2
 				continue
 			}
 		}
 
-		defer res.Body.Close()
-
-		if res.StatusCode != 200 {
-			return "", errors.New("nest: wrong status: " + res.Status)
+		if res.StatusCode != http.StatusOK {
+			status := res.Status
+			res.Body.Close()
+			return "", errors.New("nest: wrong status: "+status)
 		}
 
 		var resv struct {
@@ -213,8 +257,10 @@ func (a *API) ExchangeSDP(projectID, deviceID, offer string) (string, error) {
 		}
 
 		if err = json.NewDecoder(res.Body).Decode(&resv); err != nil {
+			res.Body.Close()
 			return "", err
 		}
+		res.Body.Close()
 
 		a.StreamProjectID = projectID
 		a.StreamDeviceID = deviceID
@@ -228,35 +274,21 @@ func (a *API) ExchangeSDP(projectID, deviceID, offer string) (string, error) {
 }
 
 func (a *API) refreshToken() error {
-	// Get the cached API with matching token to get credentials
-	var refreshKey string
-	cacheMu.Lock()
-	for key, api := range cache {
-		if api.Token == a.Token {
-			refreshKey = key
-			break
-		}
+	if a.ClientID == "" || a.ClientSecret == "" || a.RefreshToken == "" {
+		return errors.New("nest: missing cached credentials for token refresh")
 	}
+
+	key := a.ClientID + ":" + a.ClientSecret + ":" + a.RefreshToken
+
+	cacheMu.Lock()
+	delete(cache, key)
 	cacheMu.Unlock()
 
-	if refreshKey == "" {
-		return errors.New("nest: unable to find cached credentials")
-	}
-
-	// Parse credentials from cache key
-	parts := strings.Split(refreshKey, ":")
-	if len(parts) != 3 {
-		return errors.New("nest: invalid cache key format")
-	}
-	clientID, clientSecret, refreshToken := parts[0], parts[1], parts[2]
-
-	// Get new API instance which will refresh the token
-	newAPI, err := NewAPI(clientID, clientSecret, refreshToken)
+	newAPI, err := NewAPI(a.ClientID, a.ClientSecret, a.RefreshToken)
 	if err != nil {
 		return err
 	}
 
-	// Update current API with new token
 	a.Token = newAPI.Token
 	a.ExpiresAt = newAPI.ExpiresAt
 	return nil
@@ -288,43 +320,73 @@ func (a *API) ExtendStream() error {
 
 	uri := "https://smartdevicemanagement.googleapis.com/v1/enterprises/" +
 		a.StreamProjectID + "/devices/" + a.StreamDeviceID + ":executeCommand"
-	req, err := http.NewRequest("POST", uri, bytes.NewReader(b))
-	if err != nil {
-		return err
+
+	maxRetries := 3
+	retryDelay := time.Second * 30
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		req, err := http.NewRequest("POST", uri, bytes.NewReader(b))
+		if err != nil {
+			return err
+		}
+
+		req.Header.Set("Authorization", "Bearer "+a.Token)
+
+		client := &http.Client{Timeout: time.Second * 5000}
+		res, err := doNestRequest(client, req)
+		if err != nil {
+			return err
+		}
+
+		switch res.StatusCode {
+		case http.StatusUnauthorized:
+			res.Body.Close()
+			if attempt < maxRetries-1 {
+				if err := a.refreshToken(); err != nil {
+					return err
+				}
+				time.Sleep(time.Second)
+				continue
+			}
+		case http.StatusConflict, http.StatusTooManyRequests:
+			res.Body.Close()
+			if attempt < maxRetries-1 {
+				time.Sleep(retryDelay)
+				retryDelay *= 2
+				continue
+			}
+		}
+
+		if res.StatusCode != http.StatusOK {
+			status := res.Status
+			res.Body.Close()
+			return errors.New("nest: wrong status: "+status)
+		}
+
+		var resv struct {
+			Results struct {
+				ExpiresAt            time.Time `json:"expiresAt"`
+				MediaSessionID       string    `json:"mediaSessionId"`
+				StreamExtensionToken string    `json:"streamExtensionToken"`
+				StreamToken          string    `json:"streamToken"`
+			} `json:"results"`
+		}
+
+		if err = json.NewDecoder(res.Body).Decode(&resv); err != nil {
+			res.Body.Close()
+			return err
+		}
+		res.Body.Close()
+
+		a.StreamSessionID = resv.Results.MediaSessionID
+		a.StreamExpiresAt = resv.Results.ExpiresAt
+		a.StreamExtensionToken = resv.Results.StreamExtensionToken
+		a.StreamToken = resv.Results.StreamToken
+
+		return nil
 	}
 
-	req.Header.Set("Authorization", "Bearer "+a.Token)
-
-	client := &http.Client{Timeout: time.Second * 5000}
-	res, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer res.Body.Close()
-
-	if res.StatusCode != 200 {
-		return errors.New("nest: wrong status: " + res.Status)
-	}
-
-	var resv struct {
-		Results struct {
-			ExpiresAt            time.Time `json:"expiresAt"`
-			MediaSessionID       string    `json:"mediaSessionId"`
-			StreamExtensionToken string    `json:"streamExtensionToken"`
-			StreamToken          string    `json:"streamToken"`
-		} `json:"results"`
-	}
-
-	if err = json.NewDecoder(res.Body).Decode(&resv); err != nil {
-		return err
-	}
-
-	a.StreamSessionID = resv.Results.MediaSessionID
-	a.StreamExpiresAt = resv.Results.ExpiresAt
-	a.StreamExtensionToken = resv.Results.StreamExtensionToken
-	a.StreamToken = resv.Results.StreamToken
-
-	return nil
+	return errors.New("nest: max retries exceeded")
 }
 
 func (a *API) GenerateRtspStream(projectID, deviceID string) (string, error) {
@@ -349,13 +411,14 @@ func (a *API) GenerateRtspStream(projectID, deviceID string) (string, error) {
 	req.Header.Set("Authorization", "Bearer "+a.Token)
 
 	client := &http.Client{Timeout: time.Second * 5000}
-	res, err := client.Do(req)
+	res, err := doNestRequest(client, req)
 	if err != nil {
 		return "", err
 	}
+	defer res.Body.Close()
 
-	if res.StatusCode != 200 {
-		return "", errors.New("nest: wrong status: " + res.Status)
+	if res.StatusCode != http.StatusOK {
+		return "", errors.New("nest: wrong status: "+res.Status)
 	}
 
 	var resv struct {
@@ -413,13 +476,14 @@ func (a *API) StopRTSPStream() error {
 	req.Header.Set("Authorization", "Bearer "+a.Token)
 
 	client := &http.Client{Timeout: time.Second * 5000}
-	res, err := client.Do(req)
+	res, err := doNestRequest(client, req)
 	if err != nil {
 		return err
 	}
+	defer res.Body.Close()
 
-	if res.StatusCode != 200 {
-		return errors.New("nest: wrong status: " + res.Status)
+	if res.StatusCode != http.StatusOK {
+		return errors.New("nest: wrong status: "+res.Status)
 	}
 
 	a.StreamProjectID = ""
@@ -465,22 +529,59 @@ type Device struct {
 }
 
 func (a *API) StartExtendStreamTimer() {
-	if a.extendTimer != nil {
+	a.extendMu.Lock()
+	if a.extendStop != nil {
+		a.extendMu.Unlock()
 		return
 	}
 
-	a.extendTimer = time.NewTimer(time.Until(a.StreamExpiresAt) - time.Minute)
+	stop := make(chan struct{})
+	a.extendStop = stop
+	a.extendMu.Unlock()
+
 	go func() {
-		<-a.extendTimer.C
-		if err := a.ExtendStream(); err != nil {
-			return
+		for {
+			wait := time.Until(a.StreamExpiresAt) - time.Minute - nestJitter(a.StreamDeviceID, 45*time.Second)
+			if wait < 30*time.Second {
+				wait = 30*time.Second + nestJitter(a.StreamDeviceID, 15*time.Second)
+			}
+
+			timer := time.NewTimer(wait)
+			a.extendMu.Lock()
+			if a.extendStop == stop {
+				a.extendTimer = timer
+			}
+			a.extendMu.Unlock()
+
+			select {
+			case <-timer.C:
+				if err := a.ExtendStream(); err != nil {
+					backoff := time.Minute + nestJitter(a.StreamDeviceID, 30*time.Second)
+					select {
+					case <-time.After(backoff):
+						continue
+					case <-stop:
+						return
+					}
+				}
+			case <-stop:
+				timer.Stop()
+				return
+			}
 		}
 	}()
 }
 
 func (a *API) StopExtendStreamTimer() {
+	a.extendMu.Lock()
+	stop := a.extendStop
+	if stop != nil {
+		close(stop)
+		a.extendStop = nil
+	}
 	if a.extendTimer != nil {
 		a.extendTimer.Stop()
 		a.extendTimer = nil
 	}
+	a.extendMu.Unlock()
 }
