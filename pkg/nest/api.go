@@ -158,10 +158,9 @@ func nestDeviceSuffix(deviceID string) string {
 }
 
 func doNestRequest(client *http.Client, req *http.Request, command, deviceID string, attempt int) (*http.Response, error) {
-	waitForNestRateLimit(command, deviceID)
-
 	lockStart := time.Now()
 	commandMu.Lock()
+	waitForNestRateLimit(command, deviceID)
 	lockWait := time.Since(lockStart)
 	defer commandMu.Unlock()
 
