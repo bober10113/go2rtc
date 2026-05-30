@@ -18,7 +18,7 @@ const (
 	nestCommandTimeout    = 45 * time.Second
 	nestStopTimeout       = 30 * time.Second
 
-	nestExtendLeadTime   = 4 * time.Minute
+	nestExtendLeadTime   = 2 * time.Minute
 	nestExtendJitterMax  = 2 * time.Minute
 	nestExtendMinWait    = 30 * time.Second
 	nestRetryJitterMax   = 15 * time.Second
