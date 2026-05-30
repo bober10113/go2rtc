@@ -77,7 +77,7 @@ git checkout codex/b101-nest-sessionfix
 git reset --hard origin/codex/b101-nest-sessionfix
 
 gofmt -w pkg/nest/api.go
-CGO_ENABLED=0 go build -o "$OUT" ./...
+CGO_ENABLED=0 go build -o "$OUT" .
 chmod +x "$OUT"
 
 ls -lh "$OUT"
@@ -87,6 +87,22 @@ go version -m "$OUT" | egrep 'path|mod|vcs.revision|vcs.modified|GOOS|GOARCH|CGO
 ```
 
 This creates a test binary only. It does not install or replace `/config/go2rtc`.
+
+## GitHub Actions Test Build
+
+This branch also includes a manual/branch build workflow at:
+
+```text
+.github/workflows/build-b101-go2rtc.yml
+```
+
+If GitHub Actions is enabled for the fork, every push to `codex/b101-nest-sessionfix` and every manual run of the workflow builds a Linux amd64 artifact named:
+
+```text
+go2rtc-b101-nest-sessionfix-linux-amd64
+```
+
+That artifact is only a test binary. Downloading it does not install it into Frigate.
 
 ## Before Any Install
 
