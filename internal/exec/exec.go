@@ -200,9 +200,11 @@ func handleRTSP(source string, cmd *shell.Command, path string, timeout time.Dur
 	case <-timer.C:
 		// haven't received data from app in timeout
 		log.Error().Str("source", source).Msg("[exec] timeout")
+		resetLocalNestInput(cmd.Args, "exec start timeout")
 		return nil, errors.New("exec: timeout")
 	case <-cmd.Done():
 		// app fail before we receive any data
+		resetLocalNestInput(cmd.Args, "exec exited before publishing")
 		return nil, fmt.Errorf("exec/rtsp\n%s", cmd.Stderr)
 	case prod := <-waiter:
 		// app started successfully
@@ -214,6 +216,32 @@ func handleRTSP(source string, cmd *shell.Command, path string, timeout time.Dur
 }
 
 // internal
+
+func resetLocalNestInput(args []string, reason string) {
+	i := core.Index(args, "-i")
+	if i <= 0 || i >= len(args)-1 {
+		return
+	}
+
+	u, err := url.Parse(args[i+1])
+	if err != nil || u.Scheme != "rtsp" || u.Path == "" {
+		return
+	}
+
+	host := u.Hostname()
+	if host != "127.0.0.1" && host != "localhost" && host != "::1" {
+		return
+	}
+
+	name := strings.TrimPrefix(u.Path, "/")
+	if name == "" {
+		return
+	}
+
+	if streams.ResetIfSourceScheme(name, "nest", reason) {
+		log.Warn().Str("stream", name).Str("reason", reason).Msg("[exec] reset upstream nest stream")
+	}
+}
 
 var (
 	log       zerolog.Logger
@@ -236,7 +264,7 @@ func (l *logWriter) String() string {
 
 func (l *logWriter) Write(p []byte) (n int, err error) {
 	if l.n < cap(l.buf) {
-		l.n += copy(l.buf[l.n:], p)
+		l.n += copy(l.n)
 	}
 	n = len(p)
 	if l.debug {
