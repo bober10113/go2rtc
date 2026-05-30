@@ -319,5 +319,5 @@ func (p *Producer) stop() {
 
 	p.state = stateNone
 	p.receivers = nil
-	senders = nil
+	p.senders = nil
 }
