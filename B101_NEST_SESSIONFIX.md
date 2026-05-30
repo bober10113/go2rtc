@@ -55,7 +55,36 @@ Raw no-video regeneration and derived exec readiness/gating are still follow-up 
 - Closes HTTP response bodies in Nest command paths.
 - Protects extension timer state with a mutex.
 
-## Build From GitHub
+## Download Test Binary From Release
+
+After the GitHub Actions workflow publishes the prerelease, download the test binary directly on the Frigate LXC/host:
+
+```bash
+set -euo pipefail
+
+WORK="/root/go2rtc-fork-work"
+BUILDS="$WORK/builds"
+BIN="$BUILDS/go2rtc-b101-nest-sessionfix-linux-amd64"
+SHA="$BIN.sha256"
+META="$BIN.go-version-m.txt"
+BASE_URL="https://github.com/bober10113/go2rtc/releases/download/b101-nest-sessionfix-test"
+
+mkdir -p "$BUILDS"
+cd "$BUILDS"
+
+curl -fL -o "$(basename "$BIN")" "$BASE_URL/go2rtc-b101-nest-sessionfix-linux-amd64"
+curl -fL -o "$(basename "$SHA")" "$BASE_URL/go2rtc-b101-nest-sessionfix-linux-amd64.sha256"
+curl -fL -o "$(basename "$META")" "$BASE_URL/go2rtc-b101-nest-sessionfix-linux-amd64.go-version-m.txt"
+
+chmod +x "$BIN"
+sha256sum -c "$(basename "$SHA")"
+timeout 5 "$BIN" -version 2>&1 || true
+go version -m "$BIN" | egrep 'path|mod|vcs.revision|vcs.modified|GOOS|GOARCH|CGO_ENABLED' || true
+```
+
+This downloads and verifies a test binary only. It does not install or replace `/config/go2rtc`.
+
+## Build From GitHub Source
 
 ```bash
 set -euo pipefail
@@ -102,7 +131,13 @@ If GitHub Actions is enabled for the fork, every push to `codex/b101-nest-sessio
 go2rtc-b101-nest-sessionfix-linux-amd64
 ```
 
-That artifact is only a test binary. Downloading it does not install it into Frigate.
+The workflow also publishes the same files to the prerelease tag:
+
+```text
+b101-nest-sessionfix-test
+```
+
+That artifact/release asset is only a test binary. Downloading it does not install it into Frigate.
 
 ## Before Any Install
 
