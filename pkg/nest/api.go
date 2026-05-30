@@ -22,6 +22,8 @@ const (
 	nestExtendJitterMax  = 2 * time.Minute
 	nestExtendMinWait    = 30 * time.Second
 	nestRetryJitterMax   = 15 * time.Second
+	nestRateLimitBase    = 2 * time.Minute
+	nestRateLimitMax     = 15 * time.Minute
 	nestFailureWindow    = 5 * time.Minute
 	nestFailureCooldown2 = 10 * time.Second
 	nestFailureCooldown3 = 30 * time.Second
@@ -49,6 +51,7 @@ type API struct {
 	extendMu             sync.Mutex
 	extendTimer          *time.Timer
 	extendStop           chan struct{}
+	extendOwner          *nestExtendOwner
 
 	failureMu      sync.Mutex
 	failureCount   int
@@ -72,6 +75,74 @@ var cacheMu sync.Mutex
 // This avoids several Nest cameras generating/extending/stopping at the same instant.
 var commandMu sync.Mutex
 
+var rateLimitState = struct {
+	sync.Mutex
+	until time.Time
+	count int
+}{}
+
+type nestExtendOwner struct {
+	stop      chan struct{}
+	closeOnce sync.Once
+	deviceID  string
+	sessionID string
+}
+
+func (o *nestExtendOwner) close() {
+	if o == nil {
+		return
+	}
+	o.closeOnce.Do(func() {
+		close(o.stop)
+	})
+}
+
+var nestExtendOwners = struct {
+	sync.Mutex
+	byDevice map[string]*nestExtendOwner
+}{
+	byDevice: map[string]*nestExtendOwner{},
+}
+
+type nestStatusError struct {
+	Command    string
+	StatusCode int
+	Status     string
+}
+
+func (e *nestStatusError) Error() string {
+	return "nest: wrong status: " + e.Status
+}
+
+func newNestStatusError(command string, res *http.Response) error {
+	return &nestStatusError{
+		Command:    command,
+		StatusCode: res.StatusCode,
+		Status:     res.Status,
+	}
+}
+
+func nestStatusCode(err error) int {
+	var statusErr *nestStatusError
+	if errors.As(err, &statusErr) {
+		return statusErr.StatusCode
+	}
+	return 0
+}
+
+func nestTerminalExtendStatus(err error) bool {
+	switch nestStatusCode(err) {
+	case http.StatusBadRequest, http.StatusNotFound:
+		return true
+	default:
+		return false
+	}
+}
+
+func nestRateLimitStatus(err error) bool {
+	return nestStatusCode(err) == http.StatusTooManyRequests
+}
+
 func nestLogf(format string, args ...any) {
 	log.Printf("[nest] "+format, args...)
 }
@@ -87,6 +158,8 @@ func nestDeviceSuffix(deviceID string) string {
 }
 
 func doNestRequest(client *http.Client, req *http.Request, command, deviceID string, attempt int) (*http.Response, error) {
+	waitForNestRateLimit(command, deviceID)
+
 	lockStart := time.Now()
 	commandMu.Lock()
 	lockWait := time.Since(lockStart)
@@ -101,7 +174,104 @@ func doNestRequest(client *http.Client, req *http.Request, command, deviceID str
 		return nil, err
 	}
 	nestLogf("command done command=%s device=%s attempt=%d status=%d duration=%s", command, nestDeviceSuffix(deviceID), attempt, res.StatusCode, duration.Round(time.Millisecond))
+	if res.StatusCode == http.StatusTooManyRequests {
+		recordNestRateLimit(command, deviceID)
+	}
 	return res, nil
+}
+
+func waitForNestRateLimit(command, deviceID string) {
+	rateLimitState.Lock()
+	until := rateLimitState.until
+	rateLimitState.Unlock()
+
+	if wait := time.Until(until); wait > 0 {
+		nestLogf("rate limit wait command=%s device=%s wait=%s", command, nestDeviceSuffix(deviceID), wait.Round(time.Millisecond))
+		time.Sleep(wait)
+	}
+}
+
+func recordNestRateLimit(command, deviceID string) {
+	now := time.Now()
+
+	rateLimitState.Lock()
+	if now.After(rateLimitState.until) {
+		rateLimitState.count = 0
+	}
+	rateLimitState.count++
+	count := rateLimitState.count
+
+	cooldown := nestRateLimitBase
+	for i := 1; i < count && cooldown < nestRateLimitMax; i++ {
+		cooldown *= 2
+	}
+	if cooldown > nestRateLimitMax {
+		cooldown = nestRateLimitMax
+	}
+	cooldown += nestJitter(deviceID, nestRetryJitterMax)
+
+	until := now.Add(cooldown)
+	if until.After(rateLimitState.until) {
+		rateLimitState.until = until
+	}
+	rateLimitState.Unlock()
+
+	nestLogf("rate limit cooldown command=%s device=%s wait=%s", command, nestDeviceSuffix(deviceID), cooldown.Round(time.Millisecond))
+}
+
+func registerNestExtendOwner(owner *nestExtendOwner) {
+	if owner == nil || owner.deviceID == "" {
+		return
+	}
+
+	nestExtendOwners.Lock()
+	previous := nestExtendOwners.byDevice[owner.deviceID]
+	if previous != nil && previous != owner {
+		previous.close()
+		nestLogf("extend superseded device=%s", nestDeviceSuffix(owner.deviceID))
+	}
+	nestExtendOwners.byDevice[owner.deviceID] = owner
+	nestExtendOwners.Unlock()
+}
+
+func unregisterNestExtendOwner(owner *nestExtendOwner) {
+	if owner == nil || owner.deviceID == "" {
+		return
+	}
+
+	nestExtendOwners.Lock()
+	if nestExtendOwners.byDevice[owner.deviceID] == owner {
+		delete(nestExtendOwners.byDevice, owner.deviceID)
+	}
+	nestExtendOwners.Unlock()
+}
+
+func (a *API) clearExtendOwner(owner *nestExtendOwner) {
+	a.extendMu.Lock()
+	if a.extendOwner == owner {
+		a.extendOwner = nil
+		a.extendStop = nil
+		a.extendTimer = nil
+	}
+	a.extendMu.Unlock()
+
+	unregisterNestExtendOwner(owner)
+}
+
+func (a *API) clearTerminalStreamSession(owner *nestExtendOwner) {
+	a.extendMu.Lock()
+	if a.extendOwner == owner {
+		a.extendOwner = nil
+		a.extendStop = nil
+		a.extendTimer = nil
+		a.StreamSessionID = ""
+		a.StreamToken = ""
+		a.StreamExtensionToken = ""
+		a.StreamExpiresAt = time.Time{}
+	}
+	a.extendMu.Unlock()
+
+	unregisterNestExtendOwner(owner)
 }
 
 func (a *API) CloneForStream() *API {
@@ -206,7 +376,7 @@ func NewAPI(clientID, clientSecret, refreshToken string) (*API, error) {
 	defer res.Body.Close()
 
 	if res.StatusCode != 200 {
-		return nil, errors.New("nest: wrong status: " + res.Status)
+		return nil, newNestStatusError("NewAPI", res)
 	}
 
 	var resv struct {
@@ -250,7 +420,7 @@ func (a *API) GetDevices(projectID string) ([]DeviceInfo, error) {
 	defer res.Body.Close()
 
 	if res.StatusCode != 200 {
-		return nil, errors.New("nest: wrong status: " + res.Status)
+		return nil, newNestStatusError("GetDevices", res)
 	}
 
 	var resv struct {
@@ -333,8 +503,8 @@ func (a *API) ExchangeSDP(projectID, deviceID, offer string) (string, error) {
 
 		switch res.StatusCode {
 		case http.StatusUnauthorized:
+			err := newNestStatusError(command, res)
 			res.Body.Close()
-			err := errors.New("nest: wrong status: " + res.Status)
 			if attempt < maxRetries {
 				nestLogf("token refresh start command=%s device=%s attempt=%d", command, nestDeviceSuffix(deviceID), attempt)
 				if err := a.refreshToken(); err != nil {
@@ -345,8 +515,8 @@ func (a *API) ExchangeSDP(projectID, deviceID, offer string) (string, error) {
 				continue
 			}
 		case http.StatusConflict, http.StatusTooManyRequests:
+			err := newNestStatusError(command, res)
 			res.Body.Close()
-			err := errors.New("nest: wrong status: " + res.Status)
 			if attempt < maxRetries {
 				a.sleepAfterFailure(command, err, retryDelay)
 				retryDelay *= 2
@@ -355,9 +525,9 @@ func (a *API) ExchangeSDP(projectID, deviceID, offer string) (string, error) {
 		}
 
 		if res.StatusCode != http.StatusOK {
-			status := res.Status
+			err := newNestStatusError(command, res)
 			res.Body.Close()
-			return "", errors.New("nest: wrong status: "+status)
+			return "", err
 		}
 
 		var resv struct {
@@ -461,8 +631,8 @@ func (a *API) ExtendStream() error {
 
 		switch res.StatusCode {
 		case http.StatusUnauthorized:
+			err := newNestStatusError(command, res)
 			res.Body.Close()
-			err := errors.New("nest: wrong status: " + res.Status)
 			if attempt < maxRetries {
 				nestLogf("token refresh start command=%s device=%s attempt=%d", command, nestDeviceSuffix(a.StreamDeviceID), attempt)
 				if err := a.refreshToken(); err != nil {
@@ -473,8 +643,8 @@ func (a *API) ExtendStream() error {
 				continue
 			}
 		case http.StatusConflict, http.StatusTooManyRequests:
+			err := newNestStatusError(command, res)
 			res.Body.Close()
-			err := errors.New("nest: wrong status: " + res.Status)
 			if attempt < maxRetries {
 				a.sleepAfterFailure(command, err, retryDelay)
 				retryDelay *= 2
@@ -483,9 +653,9 @@ func (a *API) ExtendStream() error {
 		}
 
 		if res.StatusCode != http.StatusOK {
-			status := res.Status
+			err := newNestStatusError(command, res)
 			res.Body.Close()
-			return errors.New("nest: wrong status: "+status)
+			return err
 		}
 
 		var resv struct {
@@ -546,7 +716,7 @@ func (a *API) GenerateRtspStream(projectID, deviceID string) (string, error) {
 	defer res.Body.Close()
 
 	if res.StatusCode != http.StatusOK {
-		return "", errors.New("nest: wrong status: "+res.Status)
+		return "", newNestStatusError(command, res)
 	}
 
 	var resv struct {
@@ -614,7 +784,7 @@ func (a *API) StopRTSPStream() error {
 	defer res.Body.Close()
 
 	if res.StatusCode != http.StatusOK {
-		return errors.New("nest: wrong status: "+res.Status)
+		return newNestStatusError(command, res)
 	}
 
 	nestLogf("session stopped command=%s device=%s", command, nestDeviceSuffix(a.StreamDeviceID))
@@ -662,16 +832,25 @@ type Device struct {
 
 func (a *API) StartExtendStreamTimer() {
 	a.extendMu.Lock()
-	if a.extendStop != nil {
+	if a.extendOwner != nil {
 		a.extendMu.Unlock()
 		return
 	}
 
-	stop := make(chan struct{})
-	a.extendStop = stop
+	owner := &nestExtendOwner{
+		stop:      make(chan struct{}),
+		deviceID:  a.StreamDeviceID,
+		sessionID: a.StreamSessionID,
+	}
+	a.extendOwner = owner
+	a.extendStop = owner.stop
 	a.extendMu.Unlock()
 
+	registerNestExtendOwner(owner)
+
 	go func() {
+		defer a.clearExtendOwner(owner)
+
 		for {
 			wait := time.Until(a.StreamExpiresAt) - nestExtendLeadTime - nestJitter(a.StreamDeviceID, nestExtendJitterMax)
 			if wait < nestExtendMinWait {
@@ -681,7 +860,7 @@ func (a *API) StartExtendStreamTimer() {
 
 			timer := time.NewTimer(wait)
 			a.extendMu.Lock()
-			if a.extendStop == stop {
+			if a.extendOwner == owner {
 				a.extendTimer = timer
 			}
 			a.extendMu.Unlock()
@@ -690,15 +869,23 @@ func (a *API) StartExtendStreamTimer() {
 			case <-timer.C:
 				if err := a.ExtendStream(); err != nil {
 					backoff := nestFailureCooldown3 + nestJitter(a.StreamDeviceID, nestRetryJitterMax)
+					if nestTerminalExtendStatus(err) {
+						nestLogf("extend terminal device=%s status=%d action=stop error=%v", nestDeviceSuffix(a.StreamDeviceID), nestStatusCode(err), err)
+						a.clearTerminalStreamSession(owner)
+						return
+					}
+					if nestRateLimitStatus(err) {
+						backoff = nestRateLimitBase + nestJitter(a.StreamDeviceID, nestRetryJitterMax)
+					}
 					nestLogf("extend failed device=%s backoff=%s error=%v", nestDeviceSuffix(a.StreamDeviceID), backoff.Round(time.Millisecond), err)
 					select {
 					case <-time.After(backoff):
 						continue
-					case <-stop:
+					case <-owner.stop:
 						return
 					}
 				}
-			case <-stop:
+			case <-owner.stop:
 				timer.Stop()
 				nestLogf("extend stopped device=%s", nestDeviceSuffix(a.StreamDeviceID))
 				return
@@ -709,9 +896,10 @@ func (a *API) StartExtendStreamTimer() {
 
 func (a *API) StopExtendStreamTimer() {
 	a.extendMu.Lock()
-	stop := a.extendStop
-	if stop != nil {
-		close(stop)
+	owner := a.extendOwner
+	if owner != nil {
+		owner.close()
+		a.extendOwner = nil
 		a.extendStop = nil
 	}
 	if a.extendTimer != nil {
@@ -719,4 +907,6 @@ func (a *API) StopExtendStreamTimer() {
 		a.extendTimer = nil
 	}
 	a.extendMu.Unlock()
+
+	unregisterNestExtendOwner(owner)
 }
