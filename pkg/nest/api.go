@@ -4,11 +4,28 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
 	"sync"
 	"time"
+)
+
+const (
+	nestOAuthTimeout      = 30 * time.Second
+	nestGetDevicesTimeout = 30 * time.Second
+	nestCommandTimeout    = 45 * time.Second
+	nestStopTimeout       = 30 * time.Second
+
+	nestExtendLeadTime   = 4 * time.Minute
+	nestExtendJitterMax  = 2 * time.Minute
+	nestExtendMinWait    = 30 * time.Second
+	nestRetryJitterMax   = 15 * time.Second
+	nestFailureWindow    = 5 * time.Minute
+	nestFailureCooldown2 = 10 * time.Second
+	nestFailureCooldown3 = 30 * time.Second
+	nestFailureCooldownN = 60 * time.Second
 )
 
 type API struct {
@@ -32,6 +49,10 @@ type API struct {
 	extendMu             sync.Mutex
 	extendTimer          *time.Timer
 	extendStop           chan struct{}
+
+	failureMu      sync.Mutex
+	failureCount   int
+	firstFailureAt time.Time
 }
 
 type Auth struct {
@@ -51,10 +72,36 @@ var cacheMu sync.Mutex
 // This avoids several Nest cameras generating/extending/stopping at the same instant.
 var commandMu sync.Mutex
 
-func doNestRequest(client *http.Client, req *http.Request) (*http.Response, error) {
+func nestLogf(format string, args ...any) {
+	log.Printf("[nest] "+format, args...)
+}
+
+func nestDeviceSuffix(deviceID string) string {
+	if deviceID == "" {
+		return "unknown"
+	}
+	if len(deviceID) <= 6 {
+		return "..." + deviceID
+	}
+	return "..." + deviceID[len(deviceID)-6:]
+}
+
+func doNestRequest(client *http.Client, req *http.Request, command, deviceID string, attempt int) (*http.Response, error) {
+	lockStart := time.Now()
 	commandMu.Lock()
+	lockWait := time.Since(lockStart)
 	defer commandMu.Unlock()
-	return client.Do(req)
+
+	started := time.Now()
+	nestLogf("command start command=%s device=%s attempt=%d lock_wait=%s", command, nestDeviceSuffix(deviceID), attempt, lockWait.Round(time.Millisecond))
+	res, err := client.Do(req)
+	duration := time.Since(started)
+	if err != nil {
+		nestLogf("command error command=%s device=%s attempt=%d duration=%s error=%v", command, nestDeviceSuffix(deviceID), attempt, duration.Round(time.Millisecond), err)
+		return nil, err
+	}
+	nestLogf("command done command=%s device=%s attempt=%d status=%d duration=%s", command, nestDeviceSuffix(deviceID), attempt, res.StatusCode, duration.Round(time.Millisecond))
+	return res, nil
 }
 
 func (a *API) CloneForStream() *API {
@@ -78,6 +125,61 @@ func nestJitter(deviceID string, max time.Duration) time.Duration {
 	return time.Duration(n % int64(max))
 }
 
+func maxDuration(a, b time.Duration) time.Duration {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func (a *API) recordCommandFailure(command string, err error) time.Duration {
+	now := time.Now()
+	a.failureMu.Lock()
+	if a.firstFailureAt.IsZero() || now.Sub(a.firstFailureAt) > nestFailureWindow {
+		a.firstFailureAt = now
+		a.failureCount = 0
+	}
+	a.failureCount++
+	count := a.failureCount
+
+	var cooldown time.Duration
+	switch {
+	case count <= 1:
+		cooldown = 0
+	case count == 2:
+		cooldown = nestFailureCooldown2 + nestJitter(a.StreamDeviceID, nestRetryJitterMax)
+	case count == 3:
+		cooldown = nestFailureCooldown3 + nestJitter(a.StreamDeviceID, nestRetryJitterMax)
+	default:
+		cooldown = nestFailureCooldownN + nestJitter(a.StreamDeviceID, nestRetryJitterMax)
+	}
+	a.failureMu.Unlock()
+
+	nestLogf("command failure command=%s device=%s failures=%d cooldown=%s error=%v", command, nestDeviceSuffix(a.StreamDeviceID), count, cooldown.Round(time.Millisecond), err)
+	return cooldown
+}
+
+func (a *API) recordCommandSuccess(command string) {
+	a.failureMu.Lock()
+	count := a.failureCount
+	a.failureCount = 0
+	a.firstFailureAt = time.Time{}
+	a.failureMu.Unlock()
+	if count > 0 {
+		nestLogf("command recovered command=%s device=%s previous_failures=%d", command, nestDeviceSuffix(a.StreamDeviceID), count)
+	}
+}
+
+func (a *API) sleepAfterFailure(command string, err error, base time.Duration) {
+	cooldown := a.recordCommandFailure(command, err)
+	wait := maxDuration(base, cooldown)
+	if wait <= 0 {
+		return
+	}
+	nestLogf("retry backoff command=%s device=%s wait=%s", command, nestDeviceSuffix(a.StreamDeviceID), wait.Round(time.Millisecond))
+	time.Sleep(wait)
+}
+
 func NewAPI(clientID, clientSecret, refreshToken string) (*API, error) {
 	cacheMu.Lock()
 	defer cacheMu.Unlock()
@@ -96,7 +198,7 @@ func NewAPI(clientID, clientSecret, refreshToken string) (*API, error) {
 		"refresh_token": []string{refreshToken},
 	}
 
-	client := &http.Client{Timeout: time.Second * 5000}
+	client := &http.Client{Timeout: nestOAuthTimeout}
 	res, err := client.PostForm("https://www.googleapis.com/oauth2/v4/token", data)
 	if err != nil {
 		return nil, err
@@ -140,8 +242,8 @@ func (a *API) GetDevices(projectID string) ([]DeviceInfo, error) {
 
 	req.Header.Set("Authorization", "Bearer "+a.Token)
 
-	client := &http.Client{Timeout: time.Second * 5000}
-	res, err := doNestRequest(client, req)
+	client := &http.Client{Timeout: nestGetDevicesTimeout}
+	res, err := doNestRequest(client, req, "GetDevices", "", 1)
 	if err != nil {
 		return nil, err
 	}
@@ -189,6 +291,7 @@ func (a *API) GetDevices(projectID string) ([]DeviceInfo, error) {
 }
 
 func (a *API) ExchangeSDP(projectID, deviceID, offer string) (string, error) {
+	command := "GenerateWebRtcStream"
 	var reqv struct {
 		Command string `json:"command"`
 		Params  struct {
@@ -209,7 +312,7 @@ func (a *API) ExchangeSDP(projectID, deviceID, offer string) (string, error) {
 	maxRetries := 3
 	retryDelay := time.Second * 30
 
-	for attempt := 0; attempt < maxRetries; attempt++ {
+	for attempt := 1; attempt <= maxRetries; attempt++ {
 		req, err := http.NewRequest("POST", uri, bytes.NewReader(b))
 		if err != nil {
 			return "", err
@@ -217,26 +320,35 @@ func (a *API) ExchangeSDP(projectID, deviceID, offer string) (string, error) {
 
 		req.Header.Set("Authorization", "Bearer "+a.Token)
 
-		client := &http.Client{Timeout: time.Second * 5000}
-		res, err := doNestRequest(client, req)
+		client := &http.Client{Timeout: nestCommandTimeout}
+		res, err := doNestRequest(client, req, command, deviceID, attempt)
 		if err != nil {
+			if attempt < maxRetries {
+				a.sleepAfterFailure(command, err, retryDelay)
+				retryDelay *= 2
+				continue
+			}
 			return "", err
 		}
 
 		switch res.StatusCode {
 		case http.StatusUnauthorized:
 			res.Body.Close()
-			if attempt < maxRetries-1 {
+			err := errors.New("nest: wrong status: " + res.Status)
+			if attempt < maxRetries {
+				nestLogf("token refresh start command=%s device=%s attempt=%d", command, nestDeviceSuffix(deviceID), attempt)
 				if err := a.refreshToken(); err != nil {
 					return "", err
 				}
-				time.Sleep(time.Second)
+				nestLogf("token refresh done command=%s device=%s attempt=%d", command, nestDeviceSuffix(deviceID), attempt)
+				a.sleepAfterFailure(command, err, time.Second)
 				continue
 			}
 		case http.StatusConflict, http.StatusTooManyRequests:
 			res.Body.Close()
-			if attempt < maxRetries-1 {
-				time.Sleep(retryDelay)
+			err := errors.New("nest: wrong status: " + res.Status)
+			if attempt < maxRetries {
+				a.sleepAfterFailure(command, err, retryDelay)
 				retryDelay *= 2
 				continue
 			}
@@ -266,6 +378,8 @@ func (a *API) ExchangeSDP(projectID, deviceID, offer string) (string, error) {
 		a.StreamDeviceID = deviceID
 		a.StreamSessionID = resv.Results.MediaSessionID
 		a.StreamExpiresAt = resv.Results.ExpiresAt
+		a.recordCommandSuccess(command)
+		nestLogf("session generated command=%s device=%s expires=%s", command, nestDeviceSuffix(deviceID), a.StreamExpiresAt.UTC().Format(time.RFC3339))
 
 		return resv.Results.Answer, nil
 	}
@@ -295,6 +409,7 @@ func (a *API) refreshToken() error {
 }
 
 func (a *API) ExtendStream() error {
+	command := "ExtendWebRtcStream"
 	var reqv struct {
 		Command string `json:"command"`
 		Params  struct {
@@ -305,6 +420,7 @@ func (a *API) ExtendStream() error {
 
 	if a.StreamToken != "" {
 		// RTSP
+		command = "ExtendRtspStream"
 		reqv.Command = "sdm.devices.commands.CameraLiveStream.ExtendRtspStream"
 		reqv.Params.StreamExtensionToken = a.StreamExtensionToken
 	} else {
@@ -322,9 +438,9 @@ func (a *API) ExtendStream() error {
 		a.StreamProjectID + "/devices/" + a.StreamDeviceID + ":executeCommand"
 
 	maxRetries := 3
-	retryDelay := time.Second * 30
+	retryDelay := time.Second * 10
 
-	for attempt := 0; attempt < maxRetries; attempt++ {
+	for attempt := 1; attempt <= maxRetries; attempt++ {
 		req, err := http.NewRequest("POST", uri, bytes.NewReader(b))
 		if err != nil {
 			return err
@@ -332,26 +448,35 @@ func (a *API) ExtendStream() error {
 
 		req.Header.Set("Authorization", "Bearer "+a.Token)
 
-		client := &http.Client{Timeout: time.Second * 5000}
-		res, err := doNestRequest(client, req)
+		client := &http.Client{Timeout: nestCommandTimeout}
+		res, err := doNestRequest(client, req, command, a.StreamDeviceID, attempt)
 		if err != nil {
+			if attempt < maxRetries {
+				a.sleepAfterFailure(command, err, retryDelay)
+				retryDelay *= 2
+				continue
+			}
 			return err
 		}
 
 		switch res.StatusCode {
 		case http.StatusUnauthorized:
 			res.Body.Close()
-			if attempt < maxRetries-1 {
+			err := errors.New("nest: wrong status: " + res.Status)
+			if attempt < maxRetries {
+				nestLogf("token refresh start command=%s device=%s attempt=%d", command, nestDeviceSuffix(a.StreamDeviceID), attempt)
 				if err := a.refreshToken(); err != nil {
 					return err
 				}
-				time.Sleep(time.Second)
+				nestLogf("token refresh done command=%s device=%s attempt=%d", command, nestDeviceSuffix(a.StreamDeviceID), attempt)
+				a.sleepAfterFailure(command, err, time.Second)
 				continue
 			}
 		case http.StatusConflict, http.StatusTooManyRequests:
 			res.Body.Close()
-			if attempt < maxRetries-1 {
-				time.Sleep(retryDelay)
+			err := errors.New("nest: wrong status: " + res.Status)
+			if attempt < maxRetries {
+				a.sleepAfterFailure(command, err, retryDelay)
 				retryDelay *= 2
 				continue
 			}
@@ -382,6 +507,8 @@ func (a *API) ExtendStream() error {
 		a.StreamExpiresAt = resv.Results.ExpiresAt
 		a.StreamExtensionToken = resv.Results.StreamExtensionToken
 		a.StreamToken = resv.Results.StreamToken
+		a.recordCommandSuccess(command)
+		nestLogf("session extended command=%s device=%s expires=%s", command, nestDeviceSuffix(a.StreamDeviceID), a.StreamExpiresAt.UTC().Format(time.RFC3339))
 
 		return nil
 	}
@@ -390,6 +517,7 @@ func (a *API) ExtendStream() error {
 }
 
 func (a *API) GenerateRtspStream(projectID, deviceID string) (string, error) {
+	command := "GenerateRtspStream"
 	var reqv struct {
 		Command string   `json:"command"`
 		Params  struct{} `json:"params"`
@@ -410,8 +538,8 @@ func (a *API) GenerateRtspStream(projectID, deviceID string) (string, error) {
 
 	req.Header.Set("Authorization", "Bearer "+a.Token)
 
-	client := &http.Client{Timeout: time.Second * 5000}
-	res, err := doNestRequest(client, req)
+	client := &http.Client{Timeout: nestCommandTimeout}
+	res, err := doNestRequest(client, req, command, deviceID, 1)
 	if err != nil {
 		return "", err
 	}
@@ -443,11 +571,14 @@ func (a *API) GenerateRtspStream(projectID, deviceID string) (string, error) {
 	a.StreamToken = resv.Results.StreamToken
 	a.StreamExtensionToken = resv.Results.StreamExtensionToken
 	a.StreamExpiresAt = resv.Results.ExpiresAt
+	a.recordCommandSuccess(command)
+	nestLogf("session generated command=%s device=%s expires=%s", command, nestDeviceSuffix(deviceID), a.StreamExpiresAt.UTC().Format(time.RFC3339))
 
 	return resv.Results.StreamURLs["rtspUrl"], nil
 }
 
 func (a *API) StopRTSPStream() error {
+	command := "StopRtspStream"
 	if a.StreamProjectID == "" || a.StreamDeviceID == "" {
 		return errors.New("nest: tried to stop rtsp stream without a project or device ID")
 	}
@@ -475,8 +606,8 @@ func (a *API) StopRTSPStream() error {
 
 	req.Header.Set("Authorization", "Bearer "+a.Token)
 
-	client := &http.Client{Timeout: time.Second * 5000}
-	res, err := doNestRequest(client, req)
+	client := &http.Client{Timeout: nestStopTimeout}
+	res, err := doNestRequest(client, req, command, a.StreamDeviceID, 1)
 	if err != nil {
 		return err
 	}
@@ -486,6 +617,7 @@ func (a *API) StopRTSPStream() error {
 		return errors.New("nest: wrong status: "+res.Status)
 	}
 
+	nestLogf("session stopped command=%s device=%s", command, nestDeviceSuffix(a.StreamDeviceID))
 	a.StreamProjectID = ""
 	a.StreamDeviceID = ""
 	a.StreamExtensionToken = ""
@@ -541,10 +673,11 @@ func (a *API) StartExtendStreamTimer() {
 
 	go func() {
 		for {
-			wait := time.Until(a.StreamExpiresAt) - time.Minute - nestJitter(a.StreamDeviceID, 45*time.Second)
-			if wait < 30*time.Second {
-				wait = 30*time.Second + nestJitter(a.StreamDeviceID, 15*time.Second)
+			wait := time.Until(a.StreamExpiresAt) - nestExtendLeadTime - nestJitter(a.StreamDeviceID, nestExtendJitterMax)
+			if wait < nestExtendMinWait {
+				wait = nestExtendMinWait + nestJitter(a.StreamDeviceID, nestRetryJitterMax)
 			}
+			nestLogf("extend scheduled device=%s wait=%s expires=%s", nestDeviceSuffix(a.StreamDeviceID), wait.Round(time.Millisecond), a.StreamExpiresAt.UTC().Format(time.RFC3339))
 
 			timer := time.NewTimer(wait)
 			a.extendMu.Lock()
@@ -556,7 +689,8 @@ func (a *API) StartExtendStreamTimer() {
 			select {
 			case <-timer.C:
 				if err := a.ExtendStream(); err != nil {
-					backoff := time.Minute + nestJitter(a.StreamDeviceID, 30*time.Second)
+					backoff := nestFailureCooldown3 + nestJitter(a.StreamDeviceID, nestRetryJitterMax)
+					nestLogf("extend failed device=%s backoff=%s error=%v", nestDeviceSuffix(a.StreamDeviceID), backoff.Round(time.Millisecond), err)
 					select {
 					case <-time.After(backoff):
 						continue
@@ -566,6 +700,7 @@ func (a *API) StartExtendStreamTimer() {
 				}
 			case <-stop:
 				timer.Stop()
+				nestLogf("extend stopped device=%s", nestDeviceSuffix(a.StreamDeviceID))
 				return
 			}
 		}
