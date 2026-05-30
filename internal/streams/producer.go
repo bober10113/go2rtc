@@ -139,6 +139,59 @@ func (p *Producer) MarshalJSON() ([]byte, error) {
 	return json.Marshal(info)
 }
 
+func (p *Producer) hasSourceScheme(scheme string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return strings.HasPrefix(p.url, scheme+":")
+}
+
+func (p *Producer) reset(reason string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.conn == nil {
+		return false
+	}
+
+	switch p.state {
+	case stateTracks, stateStart:
+	default:
+		return false
+	}
+
+	p.workerID++
+	workerID := p.workerID
+	conn := p.conn
+	log.Warn().Str("url", p.url).Str("reason", reason).Msg("[streams] reset producer")
+
+	go func() {
+		_ = conn.Stop()
+		p.reconnect(workerID, 0)
+	}()
+	return true
+}
+
+func ResetIfSourceScheme(name, scheme, reason string) bool {
+	stream := Get(name)
+	if stream == nil {
+		return false
+	}
+
+	stream.mu.Lock()
+	producers := append([]*Producer(nil), stream.producers...)
+	stream.mu.Unlock()
+
+	var reset bool
+	for _, producer := range producers {
+		if producer.hasSourceScheme(scheme) && producer.reset(reason) {
+			reset = true
+		}
+	}
+
+	return reset
+}
+
 // internals
 
 func (p *Producer) start() {
@@ -266,5 +319,5 @@ func (p *Producer) stop() {
 
 	p.state = stateNone
 	p.receivers = nil
-	p.senders = nil
+	senders = nil
 }
