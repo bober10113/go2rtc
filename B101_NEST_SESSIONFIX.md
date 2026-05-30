@@ -43,6 +43,10 @@ That means the current branch focuses on both sides:
 - Closes HTTP response bodies in Nest command paths.
 - Protects extension timer state with a mutex.
 - Resets/reconnects a stale upstream `nest:` producer when a local derived `exec:` RTSP stream fails before publishing.
+- Treats `400` and `404` responses from Nest stream extension as terminal stale-session signals, stops that extension loop, and lets a fresh stream session be generated instead of retrying the dead session forever.
+- Allows only one active Nest extension owner per device, so older extension loops are superseded when a replacement session is generated.
+- Adds account-level `429 Too Many Requests` cooldown before more Google SDM commands are attempted.
+- Redacts sensitive Nest source URLs and private local stream names from reset/timeout logs.
 
 ## Download Test Binary From Release
 
@@ -182,6 +186,7 @@ Healthy signs:
 
 - exactly one go2rtc process
 - no 429 storm
+- no repeated 400/404 extension loop on the same stale Nest session
 - no repeated exec timeout loop
 - no repeated dimensions-not-set loop
 - no repeated invalid-data loop
