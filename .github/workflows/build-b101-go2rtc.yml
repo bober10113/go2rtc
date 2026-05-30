@@ -7,7 +7,7 @@ on:
       - codex/b101-nest-sessionfix
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   linux-amd64:
@@ -34,7 +34,7 @@ jobs:
           sha256sum "$OUT" | tee "$OUT.sha256"
           go version -m "$OUT" > "$OUT.go-version-m.txt"
 
-      - name: Upload test binary
+      - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: go2rtc-b101-nest-sessionfix-linux-amd64
@@ -43,3 +43,43 @@ jobs:
             dist/go2rtc-b101-nest-sessionfix-linux-amd64.sha256
             dist/go2rtc-b101-nest-sessionfix-linux-amd64.go-version-m.txt
           if-no-files-found: error
+
+      - name: Publish test release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: b101-nest-sessionfix-test
+        run: |
+          set -euo pipefail
+          NOTES="dist/release-notes.md"
+          cat > "$NOTES" <<EOF
+          Test build for the B101 Nest session-fix branch.
+
+          Branch: ${GITHUB_REF_NAME}
+          Commit: ${GITHUB_SHA}
+
+          This is a test binary only. Do not install it over /config/go2rtc without first backing up the current binary.
+          EOF
+
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" \
+              dist/go2rtc-b101-nest-sessionfix-linux-amd64 \
+              dist/go2rtc-b101-nest-sessionfix-linux-amd64.sha256 \
+              dist/go2rtc-b101-nest-sessionfix-linux-amd64.go-version-m.txt \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+            gh release edit "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "B101 Nest session-fix test build" \
+              --notes-file "$NOTES" \
+              --prerelease
+          else
+            gh release create "$RELEASE_TAG" \
+              dist/go2rtc-b101-nest-sessionfix-linux-amd64 \
+              dist/go2rtc-b101-nest-sessionfix-linux-amd64.sha256 \
+              dist/go2rtc-b101-nest-sessionfix-linux-amd64.go-version-m.txt \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "B101 Nest session-fix test build" \
+              --notes-file "$NOTES" \
+              --prerelease
+          fi
