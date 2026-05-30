@@ -264,7 +264,7 @@ func (l *logWriter) String() string {
 
 func (l *logWriter) Write(p []byte) (n int, err error) {
 	if l.n < cap(l.buf) {
-		l.n += copy(l.n)
+		l.n += copy(l.buf[l.n:], p)
 	}
 	n = len(p)
 	if l.debug {
