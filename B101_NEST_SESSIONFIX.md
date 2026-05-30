@@ -14,16 +14,44 @@ Primary changed file:
 pkg/nest/api.go
 ```
 
+## Current v2 Test Focus
+
+The current test logs showed:
+
+- `Nest_Front_Door_Phil` had the strongest failure loop around 05:59.
+- `Nest_Back_Door` had no-frame/timestamp restart behavior around 04:41.
+- `Nest_Front_Door` should still be watched for timestamp/no-frame incidents.
+- `Nest_Kitchen` remains disabled and is not part of this work.
+- The go2rtc log showed an exec restream timeout reading `Nest_Front_Door_Phil_raw`.
+
+This v2 patch does not attempt a large media-path rewrite. It implements the safe first steps from the guidance PDF:
+
+1. Add safe Nest lifecycle logging.
+2. Replace huge Nest HTTP command timeouts with bounded timeouts.
+3. Add per-camera command failure cooldown/backoff state.
+4. Move stream extension earlier with larger per-device jitter.
+
+Raw no-video regeneration and derived exec readiness/gating are still follow-up work after the new logs show the exact lifecycle timing.
+
 ## What This Branch Changes
 
 - Stores Nest OAuth credentials on each `API` instance.
 - Returns per-stream API clones from the shared token cache.
 - Serializes Google SDM command calls with a global command lock.
+- Logs safe lifecycle details for Nest commands without tokens, secrets, full device IDs, or full Nest URLs.
+- Logs Google SDM command start/end, status, attempt, lock wait, duration, token refresh, session generation, session extension, and extension scheduling.
+- Uses bounded Nest HTTP timeouts:
+  - OAuth/token refresh: 30s
+  - GetDevices: 30s
+  - Generate/Extend stream commands: 45s
+  - Stop stream command: 30s
 - Adds deterministic per-device jitter before Nest stream extension.
+- Extends around 4 minutes before session expiry with larger jitter.
 - Converts Nest stream extension from one-shot timer behavior to a repeat loop.
 - Retries controlled transient statuses in WebRTC generation and stream extension paths.
-- Refreshes access token on `401`.
+- Refreshes access tokens on `401`.
 - Backs off for `409` and `429` without forcing token refresh.
+- Adds per-camera command failure cooldown after repeated failures.
 - Closes HTTP response bodies in Nest command paths.
 - Protects extension timer state with a mutex.
 
@@ -100,6 +128,32 @@ timeout 5 /config/go2rtc -version 2>&1 || true
 The currently working Frigate binary at `/config/go2rtc` must not be replaced unless explicitly approved.
 
 If a future test binary is approved for install, back up the current binary immediately before replacing it.
+
+## Post-Test Validation
+
+After a future approved install, collect at least 60 minutes of data and check:
+
+```bash
+bash /root/check-nest-only-reencode-health.sh 60
+bash /root/audit-recording-coverage.sh 60
+```
+
+Healthy signs:
+
+- exactly one go2rtc process
+- no 429 storm
+- no repeated exec timeout loop
+- no repeated dimensions-not-set loop
+- no repeated invalid-data loop
+- no active camera recording gaps over 2 minutes
+- `Nest_Front_Door`, `Nest_Back_Door`, and `Nest_Front_Door_Phil` remain active
+- `Nest_Kitchen` remains disabled
+
+Also inspect go2rtc logs for safe Nest lifecycle lines:
+
+```bash
+docker logs frigate 2>&1 | grep '\[nest\]' | tail -100
+```
 
 ## Rollback Pattern
 
