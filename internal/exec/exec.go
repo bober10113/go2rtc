@@ -189,7 +189,7 @@ func handleRTSP(source string, cmd *shell.Command, path string, timeout time.Dur
 	ts := time.Now()
 
 	if err := cmd.Start(); err != nil {
-		log.Error().Err(err).Str("source", source).Msg("[exec]")
+		log.Error().Err(err).Str("source", safeExecLogSource(source)).Msg("[exec]")
 		return nil, err
 	}
 
@@ -199,7 +199,7 @@ func handleRTSP(source string, cmd *shell.Command, path string, timeout time.Dur
 	select {
 	case <-timer.C:
 		// haven't received data from app in timeout
-		log.Error().Str("source", source).Msg("[exec] timeout")
+		log.Error().Str("source", safeExecLogSource(source)).Msg("[exec] timeout")
 		resetLocalNestInput(cmd.Args, "exec start timeout")
 		return nil, errors.New("exec: timeout")
 	case <-cmd.Done():
@@ -239,8 +239,17 @@ func resetLocalNestInput(args []string, reason string) {
 	}
 
 	if streams.ResetIfSourceScheme(name, "nest", reason) {
-		log.Warn().Str("stream", name).Str("reason", reason).Msg("[exec] reset upstream nest stream")
+		log.Warn().Str("reason", reason).Msg("[exec] reset upstream nest stream")
 	}
+}
+
+func safeExecLogSource(source string) string {
+	if strings.Contains(source, "rtsp://127.0.0.1:") ||
+		strings.Contains(source, "rtsp://localhost:") ||
+		strings.Contains(source, "rtsp://[::1]:") {
+		return "exec:<local rtsp source redacted>"
+	}
+	return source
 }
 
 var (
