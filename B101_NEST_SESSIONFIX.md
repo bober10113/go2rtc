@@ -8,37 +8,26 @@ Base commit:
 dc1685e9cf7a8c349181f20a1b4a44825ed394c5
 ```
 
-Primary changed file:
+This document intentionally avoids private camera names, device names, tokens, URLs, and full device IDs.
 
-```text
-pkg/nest/api.go
-```
+## Current Test Focus
 
-## Current v2 Test Focus
+The B101 logs showed two broad classes of issues:
 
-The current test logs showed:
+- Nest API/session extension mostly worked, including recovery from short `401` token-refresh events.
+- A later media-path burst affected derived Nest restreams with ffmpeg restart loops, invalid input, and RTSP demux timeout behavior.
 
-- `Nest_Front_Door_Phil` had the strongest failure loop around 05:59.
-- `Nest_Back_Door` had no-frame/timestamp restart behavior around 04:41.
-- `Nest_Front_Door` should still be watched for timestamp/no-frame incidents.
-- `Nest_Kitchen` remains disabled and is not part of this work.
-- The go2rtc log showed an exec restream timeout reading `Nest_Front_Door_Phil_raw`.
+That means the current branch focuses on both sides:
 
-This v2 patch does not attempt a large media-path rewrite. It implements the safe first steps from the guidance PDF:
-
-1. Add safe Nest lifecycle logging.
-2. Replace huge Nest HTTP command timeouts with bounded timeouts.
-3. Add per-camera command failure cooldown/backoff state.
-4. Move stream extension earlier with larger per-device jitter.
-
-Raw no-video regeneration and derived exec readiness/gating are still follow-up work after the new logs show the exact lifecycle timing.
+1. Safer Nest API/session handling.
+2. Conservative stale media-path recovery when a local derived `exec:` RTSP stream fails before publishing.
 
 ## What This Branch Changes
 
 - Stores Nest OAuth credentials on each `API` instance.
 - Returns per-stream API clones from the shared token cache.
 - Serializes Google SDM command calls with a global command lock.
-- Logs safe lifecycle details for Nest commands without tokens, secrets, full device IDs, or full Nest URLs.
+- Logs safe Nest lifecycle details without secrets, camera names, full device IDs, or credential URLs.
 - Logs Google SDM command start/end, status, attempt, lock wait, duration, token refresh, session generation, session extension, and extension scheduling.
 - Uses bounded Nest HTTP timeouts:
   - OAuth/token refresh: 30s
@@ -46,7 +35,6 @@ Raw no-video regeneration and derived exec readiness/gating are still follow-up 
   - Generate/Extend stream commands: 45s
   - Stop stream command: 30s
 - Adds deterministic per-device jitter before Nest stream extension.
-- Extends around 4 minutes before session expiry with larger jitter.
 - Converts Nest stream extension from one-shot timer behavior to a repeat loop.
 - Retries controlled transient statuses in WebRTC generation and stream extension paths.
 - Refreshes access tokens on `401`.
@@ -54,6 +42,7 @@ Raw no-video regeneration and derived exec readiness/gating are still follow-up 
 - Adds per-camera command failure cooldown after repeated failures.
 - Closes HTTP response bodies in Nest command paths.
 - Protects extension timer state with a mutex.
+- Resets/reconnects a stale upstream `nest:` producer when a local derived `exec:` RTSP stream fails before publishing.
 
 ## Download Test Binary From Release
 
@@ -105,7 +94,7 @@ git fetch origin
 git checkout codex/b101-nest-sessionfix
 git reset --hard origin/codex/b101-nest-sessionfix
 
-gofmt -w pkg/nest/api.go
+gofmt -w pkg/nest/api.go internal/exec/exec.go internal/streams/producer.go
 CGO_ENABLED=0 go build -o "$OUT" .
 chmod +x "$OUT"
 
@@ -119,7 +108,7 @@ This creates a test binary only. It does not install or replace `/config/go2rtc`
 
 ## GitHub Actions Test Build
 
-This branch also includes a manual/branch build workflow at:
+This branch includes a manual/branch build workflow at:
 
 ```text
 .github/workflows/build-b101-go2rtc.yml
@@ -197,8 +186,8 @@ Healthy signs:
 - no repeated dimensions-not-set loop
 - no repeated invalid-data loop
 - no active camera recording gaps over 2 minutes
-- `Nest_Front_Door`, `Nest_Back_Door`, and `Nest_Front_Door_Phil` remain active
-- `Nest_Kitchen` remains disabled
+- enabled Nest cameras remain active
+- disabled cameras remain disabled
 
 Also inspect go2rtc logs for safe Nest lifecycle lines:
 
