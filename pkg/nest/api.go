@@ -24,6 +24,7 @@ const (
 	nestRetryJitterMax   = 15 * time.Second
 	nestRateLimitBase    = 2 * time.Minute
 	nestRateLimitMax     = 15 * time.Minute
+	nestGenerateMinWait  = 60 * time.Second
 	nestFailureWindow    = 5 * time.Minute
 	nestFailureCooldown2 = 10 * time.Second
 	nestFailureCooldown3 = 30 * time.Second
@@ -102,6 +103,18 @@ var nestExtendOwners = struct {
 	byDevice map[string]*nestExtendOwner
 }{
 	byDevice: map[string]*nestExtendOwner{},
+}
+
+type nestGenerateGate struct {
+	sync.Mutex
+	last time.Time
+}
+
+var nestGenerateGates = struct {
+	sync.Mutex
+	byDevice map[string]*nestGenerateGate
+}{
+	byDevice: map[string]*nestGenerateGate{},
 }
 
 type nestStatusError struct {
@@ -243,6 +256,31 @@ func unregisterNestExtendOwner(owner *nestExtendOwner) {
 		delete(nestExtendOwners.byDevice, owner.deviceID)
 	}
 	nestExtendOwners.Unlock()
+}
+
+func nestGenerateGateFor(deviceID string) *nestGenerateGate {
+	nestGenerateGates.Lock()
+	gate := nestGenerateGates.byDevice[deviceID]
+	if gate == nil {
+		gate = new(nestGenerateGate)
+		nestGenerateGates.byDevice[deviceID] = gate
+	}
+	nestGenerateGates.Unlock()
+
+	return gate
+}
+
+func beginNestGenerate(deviceID string) func() {
+	gate := nestGenerateGateFor(deviceID)
+	gate.Lock()
+
+	if wait := time.Until(gate.last.Add(nestGenerateMinWait)); wait > 0 {
+		nestLogf("generate wait device=%s wait=%s", nestDeviceSuffix(deviceID), wait.Round(time.Millisecond))
+		time.Sleep(wait)
+	}
+
+	gate.last = time.Now()
+	return gate.Unlock
 }
 
 func (a *API) clearExtendOwner(owner *nestExtendOwner) {
@@ -477,6 +515,9 @@ func (a *API) ExchangeSDP(projectID, deviceID, offer string) (string, error) {
 
 	uri := "https://smartdevicemanagement.googleapis.com/v1/enterprises/" +
 		projectID + "/devices/" + deviceID + ":executeCommand"
+
+	endGenerate := beginNestGenerate(deviceID)
+	defer endGenerate()
 
 	maxRetries := 3
 	retryDelay := time.Second * 30
