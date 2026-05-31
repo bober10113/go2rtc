@@ -31,12 +31,19 @@ type Producer struct {
 	receivers []*core.Receiver
 	senders   []*core.Receiver
 
-	state    state
-	mu       sync.Mutex
-	workerID int
+	state     state
+	mu        sync.Mutex
+	workerID  int
+	lastReset time.Time
 }
 
 const SourceTemplate = "{input}"
+
+const (
+	producerResetMinInterval = 20 * time.Second
+	nestReconnectMinBackoff  = 5 * time.Second
+	execNestResetBackoff     = 15 * time.Second
+)
 
 func NewProducer(source string) *Producer {
 	if strings.Contains(source, SourceTemplate) {
@@ -160,6 +167,17 @@ func (p *Producer) reset(reason string) bool {
 		return false
 	}
 
+	now := time.Now()
+	if since := now.Sub(p.lastReset); since < producerResetMinInterval {
+		log.Warn().
+			Str("url", safeProducerURL(p.url)).
+			Str("reason", reason).
+			Stringer("wait", (producerResetMinInterval - since).Round(time.Millisecond)).
+			Msg("[streams] skip duplicate producer reset")
+		return true
+	}
+	p.lastReset = now
+
 	p.workerID++
 	workerID := p.workerID
 	conn := p.conn
@@ -241,14 +259,7 @@ func (p *Producer) reconnect(workerID, retry int) {
 	if err != nil {
 		log.Debug().Msgf("[streams] producer=%s", err)
 
-		timeout := time.Minute
-		if retry < 5 {
-			timeout = time.Second
-		} else if retry < 10 {
-			timeout = time.Second * 5
-		} else if retry < 20 {
-			timeout = time.Second * 10
-		}
+		timeout := p.reconnectBackoff(retry, err)
 
 		time.AfterFunc(timeout, func() {
 			p.reconnect(workerID, retry+1)
@@ -293,6 +304,33 @@ func (p *Producer) reconnect(workerID, retry int) {
 	p.conn = conn
 
 	go p.worker(conn, workerID)
+}
+
+func (p *Producer) reconnectBackoff(retry int, err error) time.Duration {
+	if err != nil && strings.Contains(err.Error(), "exec: local nest upstream reset") {
+		if retry < 3 {
+			return execNestResetBackoff
+		}
+		if retry < 8 {
+			return 30 * time.Second
+		}
+		return time.Minute
+	}
+
+	timeout := time.Minute
+	if retry < 5 {
+		timeout = time.Second
+	} else if retry < 10 {
+		timeout = 5 * time.Second
+	} else if retry < 20 {
+		timeout = 10 * time.Second
+	}
+
+	if strings.HasPrefix(p.url, "nest:") && timeout < nestReconnectMinBackoff {
+		timeout = nestReconnectMinBackoff
+	}
+
+	return timeout
 }
 
 func (p *Producer) stop() {
