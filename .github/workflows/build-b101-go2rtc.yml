@@ -69,6 +69,7 @@ jobs:
               --clobber
             gh release edit "$RELEASE_TAG" \
               --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
               --title "B101 Nest session-fix test build" \
               --notes-file "$NOTES" \
               --prerelease
