@@ -65,6 +65,8 @@ var allowPaths []string
 
 const (
 	localNestRecoveryWindow = 60 * time.Second
+	localNestRecoveryMax    = 3 * time.Minute
+	localNestRecoveryRetry  = 10 * time.Second
 	localNestStartTimeout   = 90 * time.Second
 )
 
@@ -72,9 +74,14 @@ var errLocalNestUpstreamReset = errors.New("exec: local nest upstream reset")
 
 var localNestRecovery = struct {
 	sync.Mutex
-	until map[string]time.Time
+	items map[string]localNestRecoveryItem
 }{
-	until: map[string]time.Time{},
+	items: map[string]localNestRecoveryItem{},
+}
+
+type localNestRecoveryItem struct {
+	until    time.Time
+	deadline time.Time
 }
 
 func execHandle(rawURL string) (prod core.Producer, err error) {
@@ -286,10 +293,14 @@ func localNestInputName(args []string) (string, bool) {
 }
 
 func markLocalNestRecovery(name string) {
-	until := time.Now().Add(localNestRecoveryWindow)
+	now := time.Now()
+	item := localNestRecoveryItem{
+		until:    now.Add(localNestRecoveryWindow),
+		deadline: now.Add(localNestRecoveryMax),
+	}
 
 	localNestRecovery.Lock()
-	localNestRecovery.until[name] = until
+	localNestRecovery.items[name] = item
 	localNestRecovery.Unlock()
 }
 
@@ -297,13 +308,19 @@ func localNestRecoveryWait(name string) time.Duration {
 	now := time.Now()
 
 	localNestRecovery.Lock()
-	until := localNestRecovery.until[name]
-	if !until.IsZero() && !now.Before(until) {
-		delete(localNestRecovery.until, name)
+	item := localNestRecovery.items[name]
+	if !item.until.IsZero() && !now.Before(item.until) {
+		if streams.SourceSchemeHasMedia(name, "nest") || !now.Before(item.deadline) {
+			delete(localNestRecovery.items, name)
+			item = localNestRecoveryItem{}
+		} else {
+			item.until = now.Add(localNestRecoveryRetry)
+			localNestRecovery.items[name] = item
+		}
 	}
 	localNestRecovery.Unlock()
 
-	if wait := time.Until(until); wait > 0 {
+	if wait := time.Until(item.until); wait > 0 {
 		return wait
 	}
 	return 0
