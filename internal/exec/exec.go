@@ -63,7 +63,16 @@ func Init() {
 
 var allowPaths []string
 
+const localNestRecoveryWindow = 45 * time.Second
+
 var errLocalNestUpstreamReset = errors.New("exec: local nest upstream reset")
+
+var localNestRecovery = struct {
+	sync.Mutex
+	until map[string]time.Time
+}{
+	until: map[string]time.Time{},
+}
 
 func execHandle(rawURL string) (prod core.Producer, err error) {
 	rawURL, rawQuery, _ := strings.Cut(rawURL, "#")
@@ -170,6 +179,15 @@ func handlePipe(source string, cmd *shell.Command) (core.Producer, error) {
 }
 
 func handleRTSP(source string, cmd *shell.Command, path string, timeout time.Duration) (core.Producer, error) {
+	if name, ok := localNestInputName(cmd.Args); ok {
+		if wait := localNestRecoveryWait(name); wait > 0 {
+			log.Warn().
+				Stringer("wait", wait.Round(time.Millisecond)).
+				Msg("[exec] local nest upstream still recovering")
+			return nil, errLocalNestUpstreamReset
+		}
+	}
+
 	if log.Trace().Enabled() {
 		cmd.Stdout = os.Stdout
 	}
@@ -224,31 +242,65 @@ func handleRTSP(source string, cmd *shell.Command, path string, timeout time.Dur
 // internal
 
 func resetLocalNestInput(args []string, reason string) bool {
-	i := core.Index(args, "-i")
-	if i <= 0 || i >= len(args)-1 {
-		return false
-	}
-
-	u, err := url.Parse(args[i+1])
-	if err != nil || u.Scheme != "rtsp" || u.Path == "" {
-		return false
-	}
-
-	host := u.Hostname()
-	if host != "127.0.0.1" && host != "localhost" && host != "::1" {
-		return false
-	}
-
-	name := strings.TrimPrefix(u.Path, "/")
-	if name == "" {
+	name, ok := localNestInputName(args)
+	if !ok {
 		return false
 	}
 
 	if streams.ResetIfSourceScheme(name, "nest", reason) {
+		markLocalNestRecovery(name)
 		log.Warn().Str("reason", reason).Msg("[exec] reset upstream nest stream")
 		return true
 	}
 	return false
+}
+
+func localNestInputName(args []string) (string, bool) {
+	i := core.Index(args, "-i")
+	if i <= 0 || i >= len(args)-1 {
+		return "", false
+	}
+
+	u, err := url.Parse(args[i+1])
+	if err != nil || u.Scheme != "rtsp" || u.Path == "" {
+		return "", false
+	}
+
+	host := u.Hostname()
+	if host != "127.0.0.1" && host != "localhost" && host != "::1" {
+		return "", false
+	}
+
+	name := strings.TrimPrefix(u.Path, "/")
+	if name == "" {
+		return "", false
+	}
+
+	return name, true
+}
+
+func markLocalNestRecovery(name string) {
+	until := time.Now().Add(localNestRecoveryWindow)
+
+	localNestRecovery.Lock()
+	localNestRecovery.until[name] = until
+	localNestRecovery.Unlock()
+}
+
+func localNestRecoveryWait(name string) time.Duration {
+	now := time.Now()
+
+	localNestRecovery.Lock()
+	until := localNestRecovery.until[name]
+	if !until.IsZero() && !now.Before(until) {
+		delete(localNestRecovery.until, name)
+	}
+	localNestRecovery.Unlock()
+
+	if wait := time.Until(until); wait > 0 {
+		return wait
+	}
+	return 0
 }
 
 func safeExecLogSource(source string) string {
@@ -281,7 +333,7 @@ func (l *logWriter) String() string {
 
 func (l *logWriter) Write(p []byte) (n int, err error) {
 	if l.n < cap(l.buf) {
-		l.n += copy(l.buf[l.n:], p)
+		l.n += copy(l.n:)
 	}
 	n = len(p)
 	if l.debug {
