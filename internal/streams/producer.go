@@ -153,7 +153,7 @@ func (p *Producer) hasSourceScheme(scheme string) bool {
 	return strings.HasPrefix(p.url, scheme+":")
 }
 
-func (p *Producer) reset(reason string) (bool, bool) {
+func (p *Producer) reset(reason string) (bool, bool, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -164,19 +164,19 @@ func (p *Producer) reset(reason string) (bool, bool) {
 			Str("reason", reason).
 			Stringer("wait", (producerResetMinInterval - since).Round(time.Millisecond)).
 			Msg("[streams] skip duplicate producer reset")
-		return true, false
+		return true, false, false
 	}
 	p.lastReset = now
 
 	if p.conn == nil {
 		log.Warn().Str("url", safeProducerURL(p.url)).Str("reason", reason).Msg("[streams] mark inactive producer reset")
-		return true, true
+		return true, true, true
 	}
 
 	switch p.state {
 	case stateMedias, stateTracks, stateStart:
 	default:
-		return false, false
+		return false, false, false
 	}
 
 	p.workerID++
@@ -188,18 +188,18 @@ func (p *Producer) reset(reason string) (bool, bool) {
 		_ = conn.Stop()
 		p.reconnect(workerID, 0)
 	}()
-	return true, true
+	return true, true, false
 }
 
 func ResetIfSourceScheme(name, scheme, reason string) bool {
-	handled, _ := ResetIfSourceSchemeDetailed(name, scheme, reason)
+	handled, _, _ := ResetIfSourceSchemeDetailed(name, scheme, reason)
 	return handled
 }
 
-func ResetIfSourceSchemeDetailed(name, scheme, reason string) (bool, bool) {
+func ResetIfSourceSchemeDetailed(name, scheme, reason string) (bool, bool, bool) {
 	stream := Get(name)
 	if stream == nil {
-		return false, false
+		return false, false, false
 	}
 
 	stream.mu.Lock()
@@ -208,15 +208,17 @@ func ResetIfSourceSchemeDetailed(name, scheme, reason string) (bool, bool) {
 
 	var handled bool
 	var changed bool
+	var inactive bool
 	for _, producer := range producers {
 		if producer.hasSourceScheme(scheme) {
-			producerHandled, producerChanged := producer.reset(reason)
+			producerHandled, producerChanged, producerInactive := producer.reset(reason)
 			handled = handled || producerHandled
 			changed = changed || producerChanged
+			inactive = inactive || producerInactive
 		}
 	}
 
-	return handled, changed
+	return handled, changed, inactive
 }
 
 // internals
