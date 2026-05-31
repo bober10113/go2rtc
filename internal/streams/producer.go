@@ -157,16 +157,6 @@ func (p *Producer) reset(reason string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if p.conn == nil {
-		return false
-	}
-
-	switch p.state {
-	case stateTracks, stateStart:
-	default:
-		return false
-	}
-
 	now := time.Now()
 	if since := now.Sub(p.lastReset); since < producerResetMinInterval {
 		log.Warn().
@@ -177,6 +167,17 @@ func (p *Producer) reset(reason string) bool {
 		return true
 	}
 	p.lastReset = now
+
+	if p.conn == nil {
+		log.Warn().Str("url", safeProducerURL(p.url)).Str("reason", reason).Msg("[streams] mark inactive producer reset")
+		return true
+	}
+
+	switch p.state {
+	case stateMedias, stateTracks, stateStart:
+	default:
+		return false
+	}
 
 	p.workerID++
 	workerID := p.workerID
