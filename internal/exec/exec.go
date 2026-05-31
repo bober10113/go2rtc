@@ -63,6 +63,8 @@ func Init() {
 
 var allowPaths []string
 
+var errLocalNestUpstreamReset = errors.New("exec: local nest upstream reset")
+
 func execHandle(rawURL string) (prod core.Producer, err error) {
 	rawURL, rawQuery, _ := strings.Cut(rawURL, "#")
 	query := streams.ParseQuery(rawQuery)
@@ -200,11 +202,15 @@ func handleRTSP(source string, cmd *shell.Command, path string, timeout time.Dur
 	case <-timer.C:
 		// haven't received data from app in timeout
 		log.Error().Str("source", safeExecLogSource(source)).Msg("[exec] timeout")
-		resetLocalNestInput(cmd.Args, "exec start timeout")
+		if resetLocalNestInput(cmd.Args, "exec start timeout") {
+			return nil, errLocalNestUpstreamReset
+		}
 		return nil, errors.New("exec: timeout")
 	case <-cmd.Done():
 		// app fail before we receive any data
-		resetLocalNestInput(cmd.Args, "exec exited before publishing")
+		if resetLocalNestInput(cmd.Args, "exec exited before publishing") {
+			return nil, errLocalNestUpstreamReset
+		}
 		return nil, fmt.Errorf("exec/rtsp\n%s", cmd.Stderr)
 	case prod := <-waiter:
 		// app started successfully
@@ -217,30 +223,32 @@ func handleRTSP(source string, cmd *shell.Command, path string, timeout time.Dur
 
 // internal
 
-func resetLocalNestInput(args []string, reason string) {
+func resetLocalNestInput(args []string, reason string) bool {
 	i := core.Index(args, "-i")
 	if i <= 0 || i >= len(args)-1 {
-		return
+		return false
 	}
 
 	u, err := url.Parse(args[i+1])
 	if err != nil || u.Scheme != "rtsp" || u.Path == "" {
-		return
+		return false
 	}
 
 	host := u.Hostname()
 	if host != "127.0.0.1" && host != "localhost" && host != "::1" {
-		return
+		return false
 	}
 
 	name := strings.TrimPrefix(u.Path, "/")
 	if name == "" {
-		return
+		return false
 	}
 
 	if streams.ResetIfSourceScheme(name, "nest", reason) {
 		log.Warn().Str("reason", reason).Msg("[exec] reset upstream nest stream")
+		return true
 	}
+	return false
 }
 
 func safeExecLogSource(source string) string {
