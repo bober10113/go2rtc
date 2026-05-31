@@ -64,6 +64,39 @@ That means the current branch focuses on both sides:
 - Adds account-level `429 Too Many Requests` cooldown before more Google SDM commands are attempted.
 - Redacts sensitive Nest source URLs and private local stream names from reset/timeout logs.
 
+## Pre-v10 Log Observation - 2026-05-31
+
+The pre-v10/v9 runtime logs showed the current issue is still in the local media recovery path, not in normal Google SDM extension handling.
+
+Sanitized findings:
+
+- Running binary during this sample: `1.9.14+dev.dc6aa3c`.
+- Frigate/go2rtc restarted around 10:53 local time.
+- First local media-path failure appeared around 11:09 local time.
+- Google SDM command handling stayed clean in this sample:
+  - no `400 Bad Request`
+  - no `401 Unauthorized`
+  - no `429 Too Many Requests`
+  - no `extend failed`
+- The visible failure pattern was local:
+  - derived RTSP/ffmpeg read timeout
+  - upstream `nest:` producer reset
+  - Frigate retrying the derived RTSP stream while go2rtc reported `local nest upstream still recovering`
+  - temporary local RTSP `404 Not Found` during the recovery window
+- A later live check showed another short recovery loop around 11:24 local time, followed by recovery.
+- Recent live stream state showed enabled Nest raw and derived streams active again.
+
+Interpretation:
+
+This does not point to a new Nest API/extension regression before v10. It reinforces the v10 target: keep derived stream recovery gated until raw Nest media has actually returned, and reset active empty Nest producers instead of letting them remain as stale placeholders.
+
+Expected v10 behavior to validate:
+
+- fewer repeated `GenerateWebRtcStream` bursts for the same local recovery event
+- no long-lived empty active Nest producers
+- any `local nest upstream still recovering` window should be bounded and followed by active media
+- Frigate may still log short retry/404 noise while it asks for a stream that go2rtc is intentionally holding back
+
 ## Download Test Binary From Release
 
 After the GitHub Actions workflow publishes the prerelease, download the test binary directly on the Frigate LXC/host:
