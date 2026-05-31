@@ -66,6 +66,9 @@ var allowPaths []string
 const (
 	localNestRecoveryWindowBase   = 10 * time.Second
 	localNestInactiveRecovery     = 10 * time.Second
+	localNestRecoveryMedium       = 30 * time.Second
+	localNestRecoveryLong         = time.Minute
+	localNestRecoveryMax          = 2 * time.Minute
 	localNestRecoveryRepeatWindow = 10 * time.Minute
 	localNestStartTimeout         = 90 * time.Second
 	localNestRecoveryStartWaitMax = 10 * time.Second
@@ -333,6 +336,14 @@ func markLocalNestRecovery(name string, reason string, inactive bool) time.Durat
 	if inactive {
 		wait = localNestInactiveRecovery
 	}
+	switch {
+	case st.failures >= 10:
+		wait = localNestRecoveryMax
+	case st.failures >= 6:
+		wait = localNestRecoveryLong
+	case st.failures >= 3:
+		wait = localNestRecoveryMedium
+	}
 	st.until = now.Add(wait)
 	localNestRecovery.state[name] = st
 	localNestRecovery.Unlock()
@@ -341,6 +352,7 @@ func markLocalNestRecovery(name string, reason string, inactive bool) time.Durat
 		Str("reason", reason).
 		Bool("inactive", inactive).
 		Int("failures", st.failures).
+		Bool("circuit_breaker", wait > localNestRecoveryWindowBase).
 		Stringer("wait", wait.Round(time.Millisecond)).
 		Msg("[exec] local nest recovery marked")
 
