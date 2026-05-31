@@ -169,8 +169,8 @@ func (p *Producer) reset(reason string) (bool, bool) {
 	p.lastReset = now
 
 	if p.conn == nil {
-		log.Warn().Str("url", safeProducerURL(p.url)).Str("reason", reason).Msg("[streams] skip inactive producer reset")
-		return true, false
+		log.Warn().Str("url", safeProducerURL(p.url)).Str("reason", reason).Msg("[streams] mark inactive producer reset")
+		return true, true
 	}
 
 	switch p.state {
