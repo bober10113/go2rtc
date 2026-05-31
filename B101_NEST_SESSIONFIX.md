@@ -21,6 +21,7 @@ That means the current branch focuses on both sides:
 
 1. Safer Nest API/session handling.
 2. Conservative stale media-path recovery when a local derived `exec:` RTSP stream fails before publishing.
+3. Less aggressive retry behavior while a Nest upstream stream is being replaced.
 
 ## What This Branch Changes
 
@@ -43,6 +44,8 @@ That means the current branch focuses on both sides:
 - Closes HTTP response bodies in Nest command paths.
 - Protects extension timer state with a mutex.
 - Resets/reconnects a stale upstream `nest:` producer when a local derived `exec:` RTSP stream fails before publishing.
+- Debounces duplicate upstream Nest resets so repeated derived-stream failures do not keep aborting the same replacement session.
+- Uses a short Nest-specific reconnect delay after upstream reset/replacement, instead of immediately retrying into a stream that is still being recreated.
 - Treats `400` and `404` responses from Nest stream extension as terminal stale-session signals, stops that extension loop, and lets a fresh stream session be generated instead of retrying the dead session forever.
 - Allows only one active Nest extension owner per device, so older extension loops are superseded when a replacement session is generated.
 - Adds account-level `429 Too Many Requests` cooldown before more Google SDM commands are attempted.
