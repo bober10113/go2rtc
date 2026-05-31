@@ -43,7 +43,16 @@ const (
 	producerResetMinInterval = 20 * time.Second
 	nestReconnectMinBackoff  = 5 * time.Second
 	execNestResetBackoff     = 15 * time.Second
+	nestWatchdogInterval     = 15 * time.Second
+	nestWatchdogEmptyAfter   = 2 * time.Minute
 )
+
+var nestWatchdogState = struct {
+	sync.Mutex
+	emptySince map[string]time.Time
+}{
+	emptySince: map[string]time.Time{},
+}
 
 func NewProducer(source string) *Producer {
 	if strings.Contains(source, SourceTemplate) {
@@ -87,6 +96,28 @@ func (p *Producer) GetMedias() []*core.Media {
 	}
 
 	return p.conn.GetMedias()
+}
+
+func (p *Producer) hasMedia() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.conn == nil {
+		return false
+	}
+
+	for _, media := range p.conn.GetMedias() {
+		if len(media.Codecs) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *Producer) hasReceivers() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.receivers) > 0 || len(p.senders) > 0
 }
 
 func (p *Producer) GetTrack(media *core.Media, codec *core.Codec) (*core.Receiver, error) {
@@ -162,7 +193,7 @@ func (p *Producer) reset(reason string) bool {
 		log.Warn().
 			Str("url", safeProducerURL(p.url)).
 			Str("reason", reason).
-			Stringer("wait", (producerResetMinInterval - since).Round(time.Millisecond)).
+			Stringer("wait", (producerResetMinInterval-since).Round(time.Millisecond)).
 			Msg("[streams] skip duplicate producer reset")
 		return true
 	}
@@ -209,6 +240,108 @@ func ResetIfSourceScheme(name, scheme, reason string) bool {
 	}
 
 	return reset
+}
+
+func SourceSchemeHasMedia(name, scheme string) bool {
+	stream := Get(name)
+	if stream == nil {
+		return false
+	}
+
+	stream.mu.Lock()
+	producers := append([]*Producer(nil), stream.producers...)
+	stream.mu.Unlock()
+
+	for _, producer := range producers {
+		if producer.hasSourceScheme(scheme) && producer.hasMedia() {
+			return true
+		}
+	}
+	return false
+}
+
+func StartNestWatchdog() {
+	go func() {
+		ticker := time.NewTicker(nestWatchdogInterval)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			nestWatchdogTick()
+		}
+	}()
+}
+
+func nestWatchdogTick() {
+	type streamSnapshot struct {
+		name   string
+		stream *Stream
+	}
+
+	type candidate struct {
+		name     string
+		producer *Producer
+	}
+
+	var snapshots []streamSnapshot
+	var candidates []candidate
+
+	streamsMu.Lock()
+	for name, stream := range streams {
+		snapshots = append(snapshots, streamSnapshot{name: name, stream: stream})
+	}
+	streamsMu.Unlock()
+
+	for _, snapshot := range snapshots {
+		snapshot.stream.mu.Lock()
+		consumers := len(snapshot.stream.consumers)
+		producers := append([]*Producer(nil), snapshot.stream.producers...)
+		snapshot.stream.mu.Unlock()
+
+		for _, producer := range producers {
+			if producer.hasSourceScheme("nest") && (consumers > 0 || producer.hasReceivers()) {
+				candidates = append(candidates, candidate{name: snapshot.name, producer: producer})
+			}
+		}
+	}
+
+	now := time.Now()
+
+	nestWatchdogState.Lock()
+	defer nestWatchdogState.Unlock()
+
+	seen := make(map[string]struct{}, len(candidates))
+	for _, item := range candidates {
+		seen[item.name] = struct{}{}
+
+		if item.producer.hasMedia() {
+			delete(nestWatchdogState.emptySince, item.name)
+			continue
+		}
+
+		since := nestWatchdogState.emptySince[item.name]
+		if since.IsZero() {
+			nestWatchdogState.emptySince[item.name] = now
+			continue
+		}
+
+		if now.Sub(since) < nestWatchdogEmptyAfter {
+			continue
+		}
+
+		if item.producer.reset("nest watchdog empty producer") {
+			log.Warn().
+				Str("stream", safeNestStreamName(item.name)).
+				Stringer("empty_for", now.Sub(since).Round(time.Second)).
+				Msg("[streams] nest watchdog reset empty producer")
+			nestWatchdogState.emptySince[item.name] = now
+		}
+	}
+
+	for name := range nestWatchdogState.emptySince {
+		if _, ok := seen[name]; !ok {
+			delete(nestWatchdogState.emptySince, name)
+		}
+	}
 }
 
 // internals
@@ -369,4 +502,11 @@ func safeProducerURL(rawURL string) string {
 		return "nest:<redacted>"
 	}
 	return rawURL
+}
+
+func safeNestStreamName(name string) string {
+	if strings.Contains(strings.ToLower(name), "nest") {
+		return "nest:<redacted>"
+	}
+	return name
 }
