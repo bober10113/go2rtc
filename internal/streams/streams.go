@@ -31,8 +31,6 @@ func Init() {
 	api.HandleFunc("api/preload", apiPreload)
 	api.HandleFunc("api/schemes", apiSchemes)
 
-	StartNestWatchdog()
-
 	if cfg.Publish == nil && cfg.Preload == nil {
 		return
 	}

@@ -10,24 +10,43 @@ dc1685e9cf7a8c349181f20a1b4a44825ed394c5
 
 This document intentionally avoids private camera names, device names, tokens, URLs, and full device IDs.
 
+## Current Safe Candidate
+
+Current candidate: **v11 rollback-safe build**.
+
+v11 intentionally restores the code tree to the known-good runtime point:
+
+```text
+dc6aa3c8fba2b1380de01abc4c284841bf451c2f
+```
+
+That is the same code revision as the binary currently running cleanly on the Frigate test system after the failed v10 rollback.
+
+## Canceled v10 Result
+
+The v10 recovery-gate/watchdog build was installed on 2026-05-31 and then rolled back.
+
+Sanitized result:
+
+- Installed v10 binary: `1.9.14+dev.4e2b274`.
+- Frigate container stayed healthy.
+- Multiple Nest-derived RTSP/ffmpeg paths entered repeated local recovery and local RTSP `404 Not Found` loops after restart.
+- The final short check before rollback did not show Google SDM `401`, `429`, or `extend failed` as the main signal.
+- The issue was local media recovery behavior, not normal Nest extension timing.
+- Rollback to `1.9.14+dev.dc6aa3c` returned the system to a clean immediate state.
+
+Conclusion:
+
+Do not deploy the v10 release binary again. v10 was too disruptive during restart recovery.
+
 ## Current Test Focus
 
 The B101 logs showed two broad classes of issues:
 
 - Nest API/session extension mostly worked, including recovery from short `401` token-refresh events.
-- A later media-path burst affected derived Nest restreams with ffmpeg restart loops, invalid input, and RTSP demux timeout behavior.
+- A later media-path burst affected derived Nest restreams with ffmpeg restart loops, invalid input, local RTSP `404`, and RTSP demux timeout behavior.
 
-That means the current branch focuses on both sides:
-
-1. Safer Nest API/session handling.
-2. Conservative stale media-path recovery when a local derived `exec:` RTSP stream fails before publishing.
-3. Less aggressive retry behavior while a Nest upstream stream is being replaced.
-4. A short local recovery gate so derived ffmpeg/RTSP restreams do not relaunch while the raw Nest stream is still rebuilding.
-5. Per-device throttling of WebRTC session generation so a retrying derived stream cannot supersede the same Nest session every few seconds.
-6. Keyframe prompting for Nest WebRTC reconnects so local RTSP/ffmpeg consumers do not start from headerless H264.
-7. Recovery marking even when a failed derived restream finds the raw Nest producer already inactive.
-8. Longer recovery gating when the raw Nest stream has not produced usable media yet.
-9. A local watchdog for active Nest producers that stay empty instead of recovering.
+For v11, the priority is stability over new behavior. The branch keeps the safer pre-v10 work and removes the disruptive v10 recovery gate/watchdog changes.
 
 ## What This Branch Changes
 
@@ -57,12 +76,18 @@ That means the current branch focuses on both sides:
 - Serializes and throttles `GenerateWebRtcStream` per device, reducing repeated session replacement when Frigate retries a recovering derived stream.
 - Sends immediate burst RTCP picture-loss indications for Nest WebRTC video, then continues periodic keyframe requests, so reconnects are more likely to deliver SPS/PPS/keyframes before derived ffmpeg copy streams publish.
 - Marks matching inactive Nest producers as reset/recovering when a derived stream fails after the raw producer has already been stopped.
-- Extends the local Nest recovery gate, up to a bounded maximum, while the raw Nest producer still has no media.
-- Adds a Nest producer watchdog that resets active empty Nest producers instead of letting them remain as dead placeholders.
 - Treats `400` and `404` responses from Nest stream extension as terminal stale-session signals, stops that extension loop, and lets a fresh stream session be generated instead of retrying the dead session forever.
 - Allows only one active Nest extension owner per device, so older extension loops are superseded when a replacement session is generated.
 - Adds account-level `429 Too Many Requests` cooldown before more Google SDM commands are attempted.
 - Redacts sensitive Nest source URLs and private local stream names from reset/timeout logs.
+
+## Removed From v11
+
+The following v10 behavior is intentionally not part of v11:
+
+- active empty Nest producer watchdog
+- extended raw-media recovery gate that can keep local RTSP returning `404`
+- startup behavior that causes Frigate to repeatedly relaunch ffmpeg while go2rtc is intentionally withholding the derived stream
 
 ## Pre-v10 Log Observation - 2026-05-31
 
@@ -85,17 +110,6 @@ Sanitized findings:
   - temporary local RTSP `404 Not Found` during the recovery window
 - A later live check showed another short recovery loop around 11:24 local time, followed by recovery.
 - Recent live stream state showed enabled Nest raw and derived streams active again.
-
-Interpretation:
-
-This does not point to a new Nest API/extension regression before v10. It reinforces the v10 target: keep derived stream recovery gated until raw Nest media has actually returned, and reset active empty Nest producers instead of letting them remain as stale placeholders.
-
-Expected v10 behavior to validate:
-
-- fewer repeated `GenerateWebRtcStream` bursts for the same local recovery event
-- no long-lived empty active Nest producers
-- any `local nest upstream still recovering` window should be bounded and followed by active media
-- Frigate may still log short retry/404 noise while it asks for a stream that go2rtc is intentionally holding back
 
 ## Download Test Binary From Release
 
@@ -147,7 +161,7 @@ git fetch origin
 git checkout codex/b101-nest-sessionfix
 git reset --hard origin/codex/b101-nest-sessionfix
 
-gofmt -w pkg/nest/api.go internal/exec/exec.go internal/streams/producer.go
+gofmt -w pkg/nest/api.go internal/exec/exec.go internal/streams/producer.go internal/webrtc/webrtc.go
 CGO_ENABLED=0 go build -o "$OUT" .
 chmod +x "$OUT"
 
@@ -243,7 +257,6 @@ Healthy signs:
 - no burst of repeated `session generated` / `extend superseded` lines for the same device during one recovery event
 - no repeated `dimensions not set` loop after a Nest WebRTC reconnect
 - no repeated one-minute `GenerateWebRtcStream` loop paired with immediate `extend stopped` for the same device
-- any `nest watchdog reset empty producer` line should be rare and followed by active media returning
 - no active camera recording gaps over 2 minutes
 - enabled Nest cameras remain active
 - disabled cameras remain disabled
