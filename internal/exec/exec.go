@@ -63,7 +63,10 @@ func Init() {
 
 var allowPaths []string
 
-const localNestRecoveryWindow = 45 * time.Second
+const (
+	localNestRecoveryWindow = 60 * time.Second
+	localNestStartTimeout   = 90 * time.Second
+)
 
 var errLocalNestUpstreamReset = errors.New("exec: local nest upstream reset")
 
@@ -180,6 +183,9 @@ func handlePipe(source string, cmd *shell.Command) (core.Producer, error) {
 
 func handleRTSP(source string, cmd *shell.Command, path string, timeout time.Duration) (core.Producer, error) {
 	if name, ok := localNestInputName(cmd.Args); ok {
+		if timeout < localNestStartTimeout {
+			timeout = localNestStartTimeout
+		}
 		if wait := localNestRecoveryWait(name); wait > 0 {
 			log.Warn().
 				Stringer("wait", wait.Round(time.Millisecond)).
