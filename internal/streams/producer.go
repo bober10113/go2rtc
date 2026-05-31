@@ -153,7 +153,7 @@ func (p *Producer) hasSourceScheme(scheme string) bool {
 	return strings.HasPrefix(p.url, scheme+":")
 }
 
-func (p *Producer) reset(reason string) bool {
+func (p *Producer) reset(reason string) (bool, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -164,19 +164,19 @@ func (p *Producer) reset(reason string) bool {
 			Str("reason", reason).
 			Stringer("wait", (producerResetMinInterval - since).Round(time.Millisecond)).
 			Msg("[streams] skip duplicate producer reset")
-		return true
+		return true, false
 	}
 	p.lastReset = now
 
 	if p.conn == nil {
 		log.Warn().Str("url", safeProducerURL(p.url)).Str("reason", reason).Msg("[streams] mark inactive producer reset")
-		return true
+		return true, true
 	}
 
 	switch p.state {
 	case stateMedias, stateTracks, stateStart:
 	default:
-		return false
+		return false, false
 	}
 
 	p.workerID++
@@ -188,27 +188,35 @@ func (p *Producer) reset(reason string) bool {
 		_ = conn.Stop()
 		p.reconnect(workerID, 0)
 	}()
-	return true
+	return true, true
 }
 
 func ResetIfSourceScheme(name, scheme, reason string) bool {
+	handled, _ := ResetIfSourceSchemeDetailed(name, scheme, reason)
+	return handled
+}
+
+func ResetIfSourceSchemeDetailed(name, scheme, reason string) (bool, bool) {
 	stream := Get(name)
 	if stream == nil {
-		return false
+		return false, false
 	}
 
 	stream.mu.Lock()
 	producers := append([]*Producer(nil), stream.producers...)
 	stream.mu.Unlock()
 
-	var reset bool
+	var handled bool
+	var changed bool
 	for _, producer := range producers {
-		if producer.hasSourceScheme(scheme) && producer.reset(reason) {
-			reset = true
+		if producer.hasSourceScheme(scheme) {
+			producerHandled, producerChanged := producer.reset(reason)
+			handled = handled || producerHandled
+			changed = changed || producerChanged
 		}
 	}
 
-	return reset
+	return handled, changed
 }
 
 // internals
