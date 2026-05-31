@@ -64,10 +64,11 @@ func Init() {
 var allowPaths []string
 
 const (
-	localNestRecoveryWindowBase   = 60 * time.Second
-	localNestRecoveryWindowMax    = 3 * time.Minute
+	localNestRecoveryWindowBase   = 10 * time.Second
+	localNestInactiveRecovery     = 10 * time.Second
 	localNestRecoveryRepeatWindow = 10 * time.Minute
 	localNestStartTimeout         = 90 * time.Second
+	localNestRecoveryStartWaitMax = 10 * time.Second
 )
 
 var errLocalNestUpstreamReset = errors.New("exec: local nest upstream reset")
@@ -207,11 +208,8 @@ func handleRTSP(source string, cmd *shell.Command, path string, timeout time.Dur
 		if timeout < localNestStartTimeout {
 			timeout = localNestStartTimeout
 		}
-		if wait := localNestRecoveryWait(name); wait > 0 {
-			log.Warn().
-				Stringer("wait", wait.Round(time.Millisecond)).
-				Msg("[exec] local nest upstream still recovering")
-			return nil, errLocalNestUpstreamReset
+		if err := waitLocalNestRecovery(name); err != nil {
+			return nil, err
 		}
 	}
 
@@ -277,13 +275,17 @@ func resetLocalNestInput(args []string, reason string) bool {
 		return false
 	}
 
-	if handled, changed := streams.ResetIfSourceSchemeDetailed(name, "nest", reason); handled {
+	if handled, changed, inactive := streams.ResetIfSourceSchemeDetailed(name, "nest", reason); handled {
 		if changed {
-			wait := markLocalNestRecovery(name, reason)
-			log.Warn().
+			wait := markLocalNestRecovery(name, reason, inactive)
+			ev := log.Warn().
 				Str("reason", reason).
-				Stringer("wait", wait.Round(time.Millisecond)).
-				Msg("[exec] reset upstream nest stream")
+				Stringer("wait", wait.Round(time.Millisecond))
+			if inactive {
+				ev.Msg("[exec] reset inactive upstream nest stream")
+			} else {
+				ev.Msg("[exec] reset upstream nest stream")
+			}
 		} else {
 			log.Warn().Str("reason", reason).Msg("[exec] upstream nest reset already in progress")
 		}
@@ -316,7 +318,7 @@ func localNestInputName(args []string) (string, bool) {
 	return name, true
 }
 
-func markLocalNestRecovery(name string, reason string) time.Duration {
+func markLocalNestRecovery(name string, reason string, inactive bool) time.Duration {
 	now := time.Now()
 
 	localNestRecovery.Lock()
@@ -328,10 +330,8 @@ func markLocalNestRecovery(name string, reason string) time.Duration {
 	st.lastFailure = now
 
 	wait := localNestRecoveryWindowBase
-	if st.failures >= 6 {
-		wait = localNestRecoveryWindowMax
-	} else if st.failures >= 3 {
-		wait = 2 * time.Minute
+	if inactive {
+		wait = localNestInactiveRecovery
 	}
 	st.until = now.Add(wait)
 	localNestRecovery.state[name] = st
@@ -339,6 +339,7 @@ func markLocalNestRecovery(name string, reason string) time.Duration {
 
 	log.Warn().
 		Str("reason", reason).
+		Bool("inactive", inactive).
 		Int("failures", st.failures).
 		Stringer("wait", wait.Round(time.Millisecond)).
 		Msg("[exec] local nest recovery marked")
@@ -361,6 +362,36 @@ func localNestRecoveryWait(name string) time.Duration {
 		return wait
 	}
 	return 0
+}
+
+func waitLocalNestRecovery(name string) error {
+	wait := localNestRecoveryWait(name)
+	if wait <= 0 {
+		return nil
+	}
+
+	if wait > localNestRecoveryStartWaitMax {
+		log.Warn().
+			Stringer("wait", wait.Round(time.Millisecond)).
+			Msg("[exec] local nest upstream still recovering")
+		return errLocalNestUpstreamReset
+	}
+
+	log.Warn().
+		Stringer("wait", wait.Round(time.Millisecond)).
+		Msg("[exec] waiting for local nest upstream recovery")
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	<-timer.C
+
+	if wait = localNestRecoveryWait(name); wait > 0 {
+		log.Warn().
+			Stringer("wait", wait.Round(time.Millisecond)).
+			Msg("[exec] local nest upstream still recovering")
+		return errLocalNestUpstreamReset
+	}
+	log.Info().Msg("[exec] local nest recovery wait complete")
+	return nil
 }
 
 func clearLocalNestRecovery(name string, reason string) {
