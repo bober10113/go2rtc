@@ -25,6 +25,9 @@ That means the current branch focuses on both sides:
 4. A short local recovery gate so derived ffmpeg/RTSP restreams do not relaunch while the raw Nest stream is still rebuilding.
 5. Per-device throttling of WebRTC session generation so a retrying derived stream cannot supersede the same Nest session every few seconds.
 6. Keyframe prompting for Nest WebRTC reconnects so local RTSP/ffmpeg consumers do not start from headerless H264.
+7. Recovery marking even when a failed derived restream finds the raw Nest producer already inactive.
+8. Longer recovery gating when the raw Nest stream has not produced usable media yet.
+9. A local watchdog for active Nest producers that stay empty instead of recovering.
 
 ## What This Branch Changes
 
@@ -52,7 +55,10 @@ That means the current branch focuses on both sides:
 - Holds local Nest-derived `exec:` RTSP starts for a short recovery window after an upstream reset, reducing rapid invalid-input and dimensions-not-set retries while the raw stream is not ready yet.
 - Gives local Nest-derived `exec:` RTSP starts a longer startup window so raw stream regeneration has time to publish before the derived restream is declared failed again.
 - Serializes and throttles `GenerateWebRtcStream` per device, reducing repeated session replacement when Frigate retries a recovering derived stream.
-- Sends periodic RTCP picture-loss indications for Nest WebRTC video, matching the existing WebRTC keyframe-request pattern so reconnects are more likely to deliver SPS/PPS/keyframes before derived ffmpeg copy streams publish.
+- Sends immediate burst RTCP picture-loss indications for Nest WebRTC video, then continues periodic keyframe requests, so reconnects are more likely to deliver SPS/PPS/keyframes before derived ffmpeg copy streams publish.
+- Marks matching inactive Nest producers as reset/recovering when a derived stream fails after the raw producer has already been stopped.
+- Extends the local Nest recovery gate, up to a bounded maximum, while the raw Nest producer still has no media.
+- Adds a Nest producer watchdog that resets active empty Nest producers instead of letting them remain as dead placeholders.
 - Treats `400` and `404` responses from Nest stream extension as terminal stale-session signals, stops that extension loop, and lets a fresh stream session be generated instead of retrying the dead session forever.
 - Allows only one active Nest extension owner per device, so older extension loops are superseded when a replacement session is generated.
 - Adds account-level `429 Too Many Requests` cooldown before more Google SDM commands are attempted.
@@ -203,6 +209,8 @@ Healthy signs:
 - any `local nest upstream still recovering` lines should be short-lived and followed by successful stream recovery
 - no burst of repeated `session generated` / `extend superseded` lines for the same device during one recovery event
 - no repeated `dimensions not set` loop after a Nest WebRTC reconnect
+- no repeated one-minute `GenerateWebRtcStream` loop paired with immediate `extend stopped` for the same device
+- any `nest watchdog reset empty producer` line should be rare and followed by active media returning
 - no active camera recording gaps over 2 minutes
 - enabled Nest cameras remain active
 - disabled cameras remain disabled
