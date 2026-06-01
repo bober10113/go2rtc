@@ -12,15 +12,15 @@ This document intentionally avoids private camera names, device names, tokens, U
 
 ## Current Safe Candidate
 
-Current candidate: **v11 rollback-safe build**.
+Current candidate: **v17 bad-media publish-probe test build**.
 
-v11 intentionally restores the code tree to the known-good runtime point:
+v17 keeps the safer recovery work and adds one targeted guard for the observed long-downtime loop:
 
-```text
-dc6aa3c8fba2b1380de01abc4c284841bf451c2f
-```
+- If a Nest-derived local RTSP restream has already failed repeatedly, a brief `exec` publish is treated as a probe, not as full recovery.
+- The failure history is cleared only after the publish survives a short stability window.
+- This prevents a short-lived bad publish from resetting the circuit breaker back to failure count 1 while the same device is still in the same outage.
 
-That is the same code revision as the binary currently running cleanly on the Frigate test system after the failed v10 rollback.
+This is intended to reduce repeated `GenerateWebRtcStream` / immediate `extend stopped` loops during bad-media recovery while still allowing quick recovery from a single short blip.
 
 ## Canceled v10 Result
 
@@ -80,6 +80,7 @@ For v11, the priority is stability over new behavior. The branch keeps the safer
 - Allows only one active Nest extension owner per device, so older extension loops are superseded when a replacement session is generated.
 - Adds account-level `429 Too Many Requests` cooldown before more Google SDM commands are attempted.
 - Redacts sensitive Nest source URLs and private local stream names from reset/timeout logs.
+- Keeps repeated-failure recovery state during a short derived-stream publish probe, so a momentary local RTSP publish does not prematurely erase the outage history.
 
 ## Removed From v11
 
@@ -162,13 +163,13 @@ git checkout codex/b101-nest-sessionfix
 git reset --hard origin/codex/b101-nest-sessionfix
 
 gofmt -w pkg/nest/api.go internal/exec/exec.go internal/streams/producer.go internal/webrtc/webrtc.go
-CGO_ENABLED=0 go build -o "$OUT" .
+CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o "$OUT" .
 chmod +x "$OUT"
 
 ls -lh "$OUT"
 sha256sum "$OUT"
 timeout 5 "$OUT" -version 2>&1 || true
-go version -m "$OUT" | egrep 'path|mod|vcs.revision|vcs.modified|GOOS|GOARCH|CGO_ENABLED' || true
+go version -m "$OUT" | egrep 'path|mod|trimpath|vcs.revision|vcs.modified|GOOS|GOARCH|CGO_ENABLED' || true
 ```
 
 This creates a test binary only. It does not install or replace `/config/go2rtc`.

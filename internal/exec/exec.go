@@ -70,6 +70,7 @@ const (
 	localNestRecoveryLong         = time.Minute
 	localNestRecoveryMax          = 2 * time.Minute
 	localNestRecoveryRepeatWindow = 10 * time.Minute
+	localNestStablePublishWindow  = 45 * time.Second
 	localNestStartTimeout         = 90 * time.Second
 	localNestRecoveryStartWaitMax = 10 * time.Second
 )
@@ -80,6 +81,7 @@ type localNestRecoveryState struct {
 	until       time.Time
 	failures    int
 	lastFailure time.Time
+	publishID   uint64
 }
 
 var localNestRecovery = struct {
@@ -261,7 +263,7 @@ func handleRTSP(source string, cmd *shell.Command, path string, timeout time.Dur
 	case prod := <-waiter:
 		// app started successfully
 		if localNestName != "" {
-			clearLocalNestRecovery(localNestName, "exec published")
+			markLocalNestPublished(localNestName, "exec published")
 		}
 		log.Debug().Stringer("launch", time.Since(ts)).Msg("[exec] run rtsp")
 		setRemoteInfo(prod, source, cmd.Args)
@@ -406,15 +408,49 @@ func waitLocalNestRecovery(name string) error {
 	return nil
 }
 
-func clearLocalNestRecovery(name string, reason string) {
+func markLocalNestPublished(name string, reason string) {
+	now := time.Now()
+
 	localNestRecovery.Lock()
-	_, ok := localNestRecovery.state[name]
-	if ok {
+	st, ok := localNestRecovery.state[name]
+	if !ok {
+		localNestRecovery.Unlock()
+		return
+	}
+
+	if st.failures < 2 {
+		delete(localNestRecovery.state, name)
+		localNestRecovery.Unlock()
+		log.Info().Str("reason", reason).Msg("[exec] local nest upstream recovered")
+		return
+	}
+
+	st.publishID++
+	publishID := st.publishID
+	st.until = now.Add(localNestStablePublishWindow)
+	localNestRecovery.state[name] = st
+	localNestRecovery.Unlock()
+
+	log.Info().
+		Str("reason", reason).
+		Int("failures", st.failures).
+		Stringer("probe", localNestStablePublishWindow).
+		Msg("[exec] local nest upstream publish probe started")
+
+	time.AfterFunc(localNestStablePublishWindow, func() {
+		completeLocalNestPublishProbe(name, reason, publishID)
+	})
+}
+
+func completeLocalNestPublishProbe(name string, reason string, publishID uint64) {
+	localNestRecovery.Lock()
+	st, ok := localNestRecovery.state[name]
+	if ok && st.publishID == publishID && time.Since(st.lastFailure) >= localNestStablePublishWindow {
 		delete(localNestRecovery.state, name)
 	}
 	localNestRecovery.Unlock()
 
-	if ok {
+	if ok && st.publishID == publishID && time.Since(st.lastFailure) >= localNestStablePublishWindow {
 		log.Info().Str("reason", reason).Msg("[exec] local nest upstream recovered")
 	}
 }
