@@ -69,20 +69,25 @@ const (
 	localNestRecoveryMedium       = 30 * time.Second
 	localNestRecoveryLong         = time.Minute
 	localNestRecoveryMax          = 2 * time.Minute
+	localNestFlapRecoveryMin      = time.Minute
+	localNestFlapRecoveryLong     = 2 * time.Minute
+	localNestFlapRecoveryMax      = 5 * time.Minute
 	localNestRecoveryRepeatWindow = 10 * time.Minute
 	localNestStablePublishWindow  = 45 * time.Second
 	localNestStartTimeout         = 90 * time.Second
 	localNestRecoveryStartWaitMax = 10 * time.Second
+	localNestProbeFailureWeight   = 2
 )
 
 var errLocalNestUpstreamReset = errors.New("exec: local nest upstream reset")
 
 type localNestRecoveryState struct {
-	until       time.Time
-	failures    int
-	lastFailure time.Time
-	publishID   uint64
-	packets     int
+	until         time.Time
+	failures      int
+	probeFailures int
+	lastFailure   time.Time
+	publishID     uint64
+	packets       int
 }
 
 var localNestRecovery = struct {
@@ -332,12 +337,13 @@ func markLocalNestRecovery(name string, reason string, inactive bool) time.Durat
 	st := localNestRecovery.state[name]
 	if st.lastFailure.IsZero() || now.Sub(st.lastFailure) > localNestRecoveryRepeatWindow {
 		st.failures = 0
+		st.probeFailures = 0
 	}
 	st.failures++
 	st.lastFailure = now
 	st.packets = status.Packets
 
-	wait := localNestRecoveryWindow(st.failures, inactive)
+	wait := localNestRecoveryWindow(st.failures, st.probeFailures, inactive)
 	st.until = now.Add(wait)
 	localNestRecovery.state[name] = st
 	localNestRecovery.Unlock()
@@ -349,6 +355,7 @@ func markLocalNestRecovery(name string, reason string, inactive bool) time.Durat
 		Int("receivers", status.Receivers).
 		Int("packets", status.Packets).
 		Int("failures", st.failures).
+		Int("probe_failures", st.probeFailures).
 		Bool("circuit_breaker", wait > localNestRecoveryWindowBase).
 		Stringer("wait", wait.Round(time.Millisecond)).
 		Msg("[exec] local nest recovery marked")
@@ -356,7 +363,7 @@ func markLocalNestRecovery(name string, reason string, inactive bool) time.Durat
 	return wait
 }
 
-func localNestRecoveryWindow(failures int, inactive bool) time.Duration {
+func localNestRecoveryWindow(failures int, probeFailures int, inactive bool) time.Duration {
 	wait := localNestRecoveryWindowBase
 	if inactive {
 		wait = localNestInactiveRecovery
@@ -369,6 +376,16 @@ func localNestRecoveryWindow(failures int, inactive bool) time.Duration {
 	case failures >= 3:
 		wait = localNestRecoveryMedium
 	}
+
+	switch {
+	case probeFailures >= 6 && wait < localNestFlapRecoveryMax:
+		wait = localNestFlapRecoveryMax
+	case probeFailures >= 4 && wait < localNestFlapRecoveryLong:
+		wait = localNestFlapRecoveryLong
+	case probeFailures >= 2 && wait < localNestFlapRecoveryMin:
+		wait = localNestFlapRecoveryMin
+	}
+
 	return wait
 }
 
@@ -453,6 +470,7 @@ func markLocalNestPublished(name string, reason string) {
 	log.Info().
 		Str("reason", reason).
 		Int("failures", st.failures).
+		Int("probe_failures", st.probeFailures).
 		Bool("media_ready", mediaReady).
 		Int("medias", status.Medias).
 		Int("receivers", status.Receivers).
@@ -476,9 +494,10 @@ func completeLocalNestPublishProbe(name string, reason string, publishID uint64)
 	if stablePublish && mediaReady {
 		delete(localNestRecovery.state, name)
 	} else if ok && st.publishID == publishID {
-		st.failures++
+		st.failures += localNestProbeFailureWeight
+		st.probeFailures++
 		st.lastFailure = now
-		wait := localNestRecoveryWindow(st.failures, !status.Handled || status.Medias == 0)
+		wait := localNestRecoveryWindow(st.failures, st.probeFailures, !status.Handled || status.Medias == 0)
 		st.until = now.Add(wait)
 		localNestRecovery.state[name] = st
 	}
@@ -500,6 +519,8 @@ func completeLocalNestPublishProbe(name string, reason string, publishID uint64)
 			Int("packets_start", st.packets).
 			Int("packets_now", status.Packets).
 			Int("failures", st.failures).
+			Int("probe_failures", st.probeFailures).
+			Stringer("wait", time.Until(st.until).Round(time.Millisecond)).
 			Msg("[exec] local nest upstream publish probe failed")
 	}
 }
