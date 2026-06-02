@@ -82,6 +82,7 @@ type localNestRecoveryState struct {
 	failures    int
 	lastFailure time.Time
 	publishID   uint64
+	packets     int
 }
 
 var localNestRecovery = struct {
@@ -325,6 +326,7 @@ func localNestInputName(args []string) (string, bool) {
 
 func markLocalNestRecovery(name string, reason string, inactive bool) time.Duration {
 	now := time.Now()
+	status := streams.SourceSchemeStatusForStream(name, "nest")
 
 	localNestRecovery.Lock()
 	st := localNestRecovery.state[name]
@@ -333,19 +335,9 @@ func markLocalNestRecovery(name string, reason string, inactive bool) time.Durat
 	}
 	st.failures++
 	st.lastFailure = now
+	st.packets = status.Packets
 
-	wait := localNestRecoveryWindowBase
-	if inactive {
-		wait = localNestInactiveRecovery
-	}
-	switch {
-	case st.failures >= 10:
-		wait = localNestRecoveryMax
-	case st.failures >= 6:
-		wait = localNestRecoveryLong
-	case st.failures >= 3:
-		wait = localNestRecoveryMedium
-	}
+	wait := localNestRecoveryWindow(st.failures, inactive)
 	st.until = now.Add(wait)
 	localNestRecovery.state[name] = st
 	localNestRecovery.Unlock()
@@ -353,11 +345,30 @@ func markLocalNestRecovery(name string, reason string, inactive bool) time.Durat
 	log.Warn().
 		Str("reason", reason).
 		Bool("inactive", inactive).
+		Int("medias", status.Medias).
+		Int("receivers", status.Receivers).
+		Int("packets", status.Packets).
 		Int("failures", st.failures).
 		Bool("circuit_breaker", wait > localNestRecoveryWindowBase).
 		Stringer("wait", wait.Round(time.Millisecond)).
 		Msg("[exec] local nest recovery marked")
 
+	return wait
+}
+
+func localNestRecoveryWindow(failures int, inactive bool) time.Duration {
+	wait := localNestRecoveryWindowBase
+	if inactive {
+		wait = localNestInactiveRecovery
+	}
+	switch {
+	case failures >= 10:
+		wait = localNestRecoveryMax
+	case failures >= 6:
+		wait = localNestRecoveryLong
+	case failures >= 3:
+		wait = localNestRecoveryMedium
+	}
 	return wait
 }
 
@@ -410,6 +421,7 @@ func waitLocalNestRecovery(name string) error {
 
 func markLocalNestPublished(name string, reason string) {
 	now := time.Now()
+	status := streams.SourceSchemeStatusForStream(name, "nest")
 
 	localNestRecovery.Lock()
 	st, ok := localNestRecovery.state[name]
@@ -418,15 +430,22 @@ func markLocalNestPublished(name string, reason string) {
 		return
 	}
 
-	if st.failures < 2 {
+	mediaReady := status.Handled && status.Medias > 0 && status.Packets > st.packets
+	if st.failures < 2 && mediaReady {
 		delete(localNestRecovery.state, name)
 		localNestRecovery.Unlock()
-		log.Info().Str("reason", reason).Msg("[exec] local nest upstream recovered")
+		log.Info().
+			Str("reason", reason).
+			Int("medias", status.Medias).
+			Int("receivers", status.Receivers).
+			Int("packets", status.Packets).
+			Msg("[exec] local nest upstream recovered")
 		return
 	}
 
 	st.publishID++
 	publishID := st.publishID
+	st.packets = status.Packets
 	st.until = now.Add(localNestStablePublishWindow)
 	localNestRecovery.state[name] = st
 	localNestRecovery.Unlock()
@@ -434,6 +453,10 @@ func markLocalNestPublished(name string, reason string) {
 	log.Info().
 		Str("reason", reason).
 		Int("failures", st.failures).
+		Bool("media_ready", mediaReady).
+		Int("medias", status.Medias).
+		Int("receivers", status.Receivers).
+		Int("packets", status.Packets).
 		Stringer("probe", localNestStablePublishWindow).
 		Msg("[exec] local nest upstream publish probe started")
 
@@ -443,15 +466,41 @@ func markLocalNestPublished(name string, reason string) {
 }
 
 func completeLocalNestPublishProbe(name string, reason string, publishID uint64) {
+	now := time.Now()
+	status := streams.SourceSchemeStatusForStream(name, "nest")
+
 	localNestRecovery.Lock()
 	st, ok := localNestRecovery.state[name]
-	if ok && st.publishID == publishID && time.Since(st.lastFailure) >= localNestStablePublishWindow {
+	stablePublish := ok && st.publishID == publishID && time.Since(st.lastFailure) >= localNestStablePublishWindow
+	mediaReady := status.Handled && status.Medias > 0 && status.Packets > st.packets
+	if stablePublish && mediaReady {
 		delete(localNestRecovery.state, name)
+	} else if ok && st.publishID == publishID {
+		st.failures++
+		st.lastFailure = now
+		wait := localNestRecoveryWindow(st.failures, !status.Handled || status.Medias == 0)
+		st.until = now.Add(wait)
+		localNestRecovery.state[name] = st
 	}
 	localNestRecovery.Unlock()
 
-	if ok && st.publishID == publishID && time.Since(st.lastFailure) >= localNestStablePublishWindow {
-		log.Info().Str("reason", reason).Msg("[exec] local nest upstream recovered")
+	if stablePublish && mediaReady {
+		log.Info().
+			Str("reason", reason).
+			Int("medias", status.Medias).
+			Int("receivers", status.Receivers).
+			Int("packets", status.Packets).
+			Msg("[exec] local nest upstream recovered")
+	} else if ok && st.publishID == publishID {
+		log.Warn().
+			Str("reason", reason).
+			Bool("handled", status.Handled).
+			Int("medias", status.Medias).
+			Int("receivers", status.Receivers).
+			Int("packets_start", st.packets).
+			Int("packets_now", status.Packets).
+			Int("failures", st.failures).
+			Msg("[exec] local nest upstream publish probe failed")
 	}
 }
 

@@ -45,6 +45,13 @@ const (
 	execNestResetBackoff     = 15 * time.Second
 )
 
+type SourceSchemeStatus struct {
+	Handled   bool
+	Medias    int
+	Receivers int
+	Packets   int
+}
+
 func NewProducer(source string) *Producer {
 	if strings.Contains(source, SourceTemplate) {
 		return &Producer{template: source}
@@ -153,6 +160,36 @@ func (p *Producer) hasSourceScheme(scheme string) bool {
 	return strings.HasPrefix(p.url, scheme+":")
 }
 
+func (p *Producer) sourceSchemeStatus(scheme string) SourceSchemeStatus {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if !strings.HasPrefix(p.url, scheme+":") {
+		return SourceSchemeStatus{}
+	}
+
+	status := SourceSchemeStatus{Handled: true}
+	if p.conn == nil {
+		return status
+	}
+
+	for _, media := range p.conn.GetMedias() {
+		if media.Direction == core.DirectionRecvonly && media.Kind == core.KindVideo && len(media.Codecs) > 0 {
+			status.Medias++
+		}
+	}
+
+	for _, receiver := range p.receivers {
+		if receiver == nil || receiver.Codec == nil || core.GetKind(receiver.Codec.Name) != core.KindVideo {
+			continue
+		}
+		status.Receivers++
+		status.Packets += receiver.Packets
+	}
+
+	return status
+}
+
 func (p *Producer) reset(reason string) (bool, bool, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -219,6 +256,31 @@ func ResetIfSourceSchemeDetailed(name, scheme, reason string) (bool, bool, bool)
 	}
 
 	return handled, changed, inactive
+}
+
+func SourceSchemeStatusForStream(name, scheme string) SourceSchemeStatus {
+	stream := Get(name)
+	if stream == nil {
+		return SourceSchemeStatus{}
+	}
+
+	stream.mu.Lock()
+	producers := append([]*Producer(nil), stream.producers...)
+	stream.mu.Unlock()
+
+	var status SourceSchemeStatus
+	for _, producer := range producers {
+		producerStatus := producer.sourceSchemeStatus(scheme)
+		if !producerStatus.Handled {
+			continue
+		}
+		status.Handled = true
+		status.Medias += producerStatus.Medias
+		status.Receivers += producerStatus.Receivers
+		status.Packets += producerStatus.Packets
+	}
+
+	return status
 }
 
 // internals
