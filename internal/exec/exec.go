@@ -286,6 +286,14 @@ func resetLocalNestInput(args []string, reason string) bool {
 		return false
 	}
 
+	if wait := localNestRecoveryWait(name); wait > 0 {
+		log.Warn().
+			Str("reason", reason).
+			Stringer("wait", wait.Round(time.Millisecond)).
+			Msg("[exec] skip upstream nest reset during active recovery")
+		return true
+	}
+
 	if handled, changed, inactive := streams.ResetIfSourceSchemeDetailed(name, "nest", reason); handled {
 		if changed {
 			wait := markLocalNestRecovery(name, reason, inactive)
