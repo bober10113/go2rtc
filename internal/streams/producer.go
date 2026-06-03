@@ -31,10 +31,12 @@ type Producer struct {
 	receivers []*core.Receiver
 	senders   []*core.Receiver
 
-	state     state
-	mu        sync.Mutex
-	workerID  int
-	lastReset time.Time
+	state            state
+	mu               sync.Mutex
+	workerID         int
+	lastReset        time.Time
+	recoveringUntil  time.Time
+	idleRecoverUntil time.Time
 }
 
 const SourceTemplate = "{input}"
@@ -43,6 +45,9 @@ const (
 	producerResetMinInterval = 20 * time.Second
 	nestReconnectMinBackoff  = 5 * time.Second
 	execNestResetBackoff     = 15 * time.Second
+	execNestIdleRecoveryMax  = 2 * time.Minute
+	deferredStopPadding      = 2 * time.Second
+	execNestResetError       = "exec: local nest upstream reset"
 )
 
 type SourceSchemeStatus struct {
@@ -73,13 +78,25 @@ func (p *Producer) Dial() error {
 	defer p.mu.Unlock()
 
 	if p.state == stateNone {
+		if wait := time.Until(p.recoveringUntil); wait > 0 {
+			log.Warn().
+				Str("url", safeProducerURL(p.url)).
+				Stringer("wait", wait.Round(time.Millisecond)).
+				Msg("[streams] skip producer dial during local nest recovery")
+			return errors.New(execNestResetError)
+		}
+
 		conn, err := GetProducer(p.url)
 		if err != nil {
+			if strings.Contains(err.Error(), execNestResetError) {
+				p.recoveringUntil = time.Now().Add(execNestResetBackoff)
+			}
 			return err
 		}
 
 		p.conn = conn
 		p.state = stateMedias
+		p.recoveringUntil = time.Time{}
 	}
 
 	return nil
@@ -99,6 +116,8 @@ func (p *Producer) GetMedias() []*core.Media {
 func (p *Producer) GetTrack(media *core.Media, codec *core.Codec) (*core.Receiver, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	p.idleRecoverUntil = time.Time{}
 
 	if p.state == stateNone {
 		return nil, errors.New("get track from none state")
@@ -127,6 +146,8 @@ func (p *Producer) GetTrack(media *core.Media, codec *core.Codec) (*core.Receive
 func (p *Producer) AddTrack(media *core.Media, codec *core.Codec, track *core.Receiver) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	p.idleRecoverUntil = time.Time{}
 
 	if p.state == stateNone {
 		return errors.New("add track from none state")
@@ -340,6 +361,8 @@ func (p *Producer) reconnect(workerID, retry int) {
 		return
 	}
 
+	p.recoveringUntil = time.Time{}
+
 	for _, media := range conn.GetMedias() {
 		switch media.Direction {
 		case core.DirectionRecvonly:
@@ -380,15 +403,23 @@ func (p *Producer) reconnect(workerID, retry int) {
 }
 
 func (p *Producer) reconnectBackoff(retry int, err error) time.Duration {
-	if err != nil && strings.Contains(err.Error(), "exec: local nest upstream reset") {
+	if err != nil && strings.Contains(err.Error(), execNestResetError) {
+		timeout := execNestResetBackoff
 		if retry < 3 {
-			return execNestResetBackoff
+			p.recoveringUntil = time.Now().Add(timeout)
+			return timeout
 		}
 		if retry < 8 {
-			return 30 * time.Second
+			timeout = 30 * time.Second
+			p.recoveringUntil = time.Now().Add(timeout)
+			return timeout
 		}
-		return time.Minute
+		timeout = time.Minute
+		p.recoveringUntil = time.Now().Add(timeout)
+		return timeout
 	}
+
+	p.recoveringUntil = time.Time{}
 
 	timeout := time.Minute
 	if retry < 5 {
@@ -406,10 +437,95 @@ func (p *Producer) reconnectBackoff(retry int, err error) time.Duration {
 	return timeout
 }
 
+func (p *Producer) hasReaders() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return p.hasReadersLocked()
+}
+
+func (p *Producer) hasReadersLocked() bool {
+	for _, track := range p.receivers {
+		if len(track.Senders()) > 0 {
+			return true
+		}
+	}
+	for _, track := range p.senders {
+		if len(track.Senders()) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *Producer) deferStopDuringRecovery() bool {
+	p.mu.Lock()
+
+	now := time.Now()
+	wait := p.recoveringUntil.Sub(now)
+	if wait <= 0 {
+		p.mu.Unlock()
+		return false
+	}
+
+	if p.idleRecoverUntil.IsZero() || now.After(p.idleRecoverUntil) {
+		p.idleRecoverUntil = now.Add(execNestIdleRecoveryMax)
+	}
+
+	stopAt := p.recoveringUntil
+	if p.idleRecoverUntil.Before(stopAt) {
+		stopAt = p.idleRecoverUntil
+	}
+	wait = time.Until(stopAt)
+	if wait < 0 {
+		wait = 0
+	}
+	wait += deferredStopPadding
+	rawURL := safeProducerURL(p.url)
+	p.mu.Unlock()
+
+	log.Warn().
+		Str("url", rawURL).
+		Stringer("wait", wait.Round(time.Millisecond)).
+		Msg("[streams] defer producer stop during local nest recovery")
+
+	time.AfterFunc(wait, p.stopAfterDeferredRecovery)
+	return true
+}
+
+func (p *Producer) stopAfterDeferredRecovery() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.hasReadersLocked() {
+		p.idleRecoverUntil = time.Time{}
+		return
+	}
+
+	now := time.Now()
+	if wait := p.recoveringUntil.Sub(now); wait > 0 && now.Before(p.idleRecoverUntil) {
+		if idleWait := p.idleRecoverUntil.Sub(now); idleWait < wait {
+			wait = idleWait
+		}
+		if wait < 0 {
+			wait = 0
+		}
+		time.AfterFunc(wait+deferredStopPadding, p.stopAfterDeferredRecovery)
+		return
+	}
+
+	log.Warn().Str("url", safeProducerURL(p.url)).Msg("[streams] stop idle producer after local nest recovery")
+	p.stopLocked()
+}
+
 func (p *Producer) stop() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	p.stopLocked()
+}
+
+func (p *Producer) stopLocked() {
 	switch p.state {
 	case stateExternal:
 		log.Trace().Msgf("[streams] skip stop external producer")
@@ -431,6 +547,8 @@ func (p *Producer) stop() {
 	p.state = stateNone
 	p.receivers = nil
 	p.senders = nil
+	p.recoveringUntil = time.Time{}
+	p.idleRecoverUntil = time.Time{}
 }
 
 func safeProducerURL(rawURL string) string {
