@@ -74,12 +74,15 @@ const (
 	localNestFlapRecoveryMax      = 5 * time.Minute
 	localNestRecoveryRepeatWindow = 10 * time.Minute
 	localNestStablePublishWindow  = 45 * time.Second
+	localNestMediaReadyTimeout    = 15 * time.Second
+	localNestMediaReadyCheck      = 500 * time.Millisecond
 	localNestStartTimeout         = 90 * time.Second
 	localNestRecoveryStartWaitMax = 10 * time.Second
 	localNestProbeFailureWeight   = 2
 )
 
 var errLocalNestUpstreamReset = errors.New("exec: local nest upstream reset")
+var errLocalNestMediaTimeout = errors.New("exec: local nest upstream media timeout")
 
 type localNestRecoveryState struct {
 	until         time.Time
@@ -269,6 +272,14 @@ func handleRTSP(source string, cmd *shell.Command, path string, timeout time.Dur
 	case prod := <-waiter:
 		// app started successfully
 		if localNestName != "" {
+			if err := waitLocalNestMediaReady(localNestName, cmd); err != nil {
+				_ = prod.Stop()
+				_ = cmd.Close()
+				if resetLocalNestInput(cmd.Args, err.Error()) {
+					return nil, errLocalNestUpstreamReset
+				}
+				return nil, err
+			}
 			markLocalNestPublished(localNestName, "exec published")
 		}
 		log.Debug().Stringer("launch", time.Since(ts)).Msg("[exec] run rtsp")
@@ -412,6 +423,61 @@ func localNestRecoveryWait(name string) time.Duration {
 		return wait
 	}
 	return 0
+}
+
+func waitLocalNestMediaReady(name string, cmd *shell.Command) error {
+	start := streams.SourceSchemeStatusForStream(name, "nest")
+	if !start.Handled {
+		return nil
+	}
+
+	deadline := time.NewTimer(localNestMediaReadyTimeout)
+	defer deadline.Stop()
+
+	ticker := time.NewTicker(localNestMediaReadyCheck)
+	defer ticker.Stop()
+
+	log.Warn().
+		Int("medias", start.Medias).
+		Int("receivers", start.Receivers).
+		Int("packets", start.Packets).
+		Stringer("timeout", localNestMediaReadyTimeout).
+		Msg("[exec] waiting for local nest upstream media")
+
+	for {
+		status := streams.SourceSchemeStatusForStream(name, "nest")
+		if status.Handled && status.Medias > 0 && status.Receivers > 0 && status.Packets > start.Packets {
+			log.Info().
+				Int("medias", status.Medias).
+				Int("receivers", status.Receivers).
+				Int("packets_start", start.Packets).
+				Int("packets_now", status.Packets).
+				Msg("[exec] local nest upstream media ready")
+			return nil
+		}
+
+		select {
+		case <-cmd.Done():
+			log.Warn().
+				Bool("handled", status.Handled).
+				Int("medias", status.Medias).
+				Int("receivers", status.Receivers).
+				Int("packets_start", start.Packets).
+				Int("packets_now", status.Packets).
+				Msg("[exec] local nest upstream media wait ended by exec exit")
+			return errors.New("exec: local nest upstream exited before media")
+		case <-deadline.C:
+			log.Warn().
+				Bool("handled", status.Handled).
+				Int("medias", status.Medias).
+				Int("receivers", status.Receivers).
+				Int("packets_start", start.Packets).
+				Int("packets_now", status.Packets).
+				Msg("[exec] local nest upstream media timeout")
+			return errLocalNestMediaTimeout
+		case <-ticker.C:
+		}
+	}
 }
 
 func waitLocalNestRecovery(name string) error {
