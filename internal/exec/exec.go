@@ -79,6 +79,7 @@ const (
 	localNestStartTimeout         = 90 * time.Second
 	localNestRecoveryStartWaitMax = 10 * time.Second
 	localNestProbeFailureWeight   = 2
+	localNestProbeHardResetAfter  = 2
 )
 
 var errLocalNestUpstreamReset = errors.New("exec: local nest upstream reset")
@@ -560,6 +561,7 @@ func markLocalNestPublished(name string, reason string) {
 func completeLocalNestPublishProbe(name string, reason string, publishID uint64) {
 	now := time.Now()
 	status := streams.SourceSchemeStatusForStream(name, "nest")
+	var hardReset bool
 
 	localNestRecovery.Lock()
 	st, ok := localNestRecovery.state[name]
@@ -573,6 +575,7 @@ func completeLocalNestPublishProbe(name string, reason string, publishID uint64)
 		st.lastFailure = now
 		wait := localNestRecoveryWindow(st.failures, st.probeFailures, !status.Handled || status.Medias == 0)
 		st.until = now.Add(wait)
+		hardReset = st.probeFailures >= localNestProbeHardResetAfter
 		localNestRecovery.state[name] = st
 	}
 	localNestRecovery.Unlock()
@@ -596,6 +599,18 @@ func completeLocalNestPublishProbe(name string, reason string, publishID uint64)
 			Int("probe_failures", st.probeFailures).
 			Stringer("wait", time.Until(st.until).Round(time.Millisecond)).
 			Msg("[exec] local nest upstream publish probe failed")
+
+		if hardReset {
+			handled, changed, inactive := streams.ResetIfSourceSchemeDetailed(name, "nest", "exec publish probe failed")
+			log.Warn().
+				Str("reason", reason).
+				Bool("handled", handled).
+				Bool("changed", changed).
+				Bool("inactive", inactive).
+				Int("failures", st.failures).
+				Int("probe_failures", st.probeFailures).
+				Msg("[exec] local nest upstream hard reset requested")
+		}
 	}
 }
 
