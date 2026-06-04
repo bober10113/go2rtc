@@ -35,6 +35,8 @@ type Producer struct {
 	mu               sync.Mutex
 	workerID         int
 	lastReset        time.Time
+	execNestFailures int
+	execNestLastFail time.Time
 	recoveringUntil  time.Time
 	idleRecoverUntil time.Time
 }
@@ -45,6 +47,10 @@ const (
 	producerResetMinInterval = 20 * time.Second
 	nestReconnectMinBackoff  = 5 * time.Second
 	execNestResetBackoff     = 15 * time.Second
+	execNestBackoffMedium    = 30 * time.Second
+	execNestBackoffLong      = time.Minute
+	execNestBackoffMax       = 2 * time.Minute
+	execNestBackoffWindow    = 10 * time.Minute
 	execNestIdleRecoveryMax  = 2 * time.Minute
 	deferredStopPadding      = 2 * time.Second
 	execNestResetError       = "exec: local nest upstream reset"
@@ -89,7 +95,12 @@ func (p *Producer) Dial() error {
 		conn, err := GetProducer(p.url)
 		if err != nil {
 			if strings.Contains(err.Error(), execNestResetError) {
-				p.recoveringUntil = time.Now().Add(execNestResetBackoff)
+				wait := p.markExecNestBackoffLocked()
+				log.Warn().
+					Str("url", safeProducerURL(p.url)).
+					Int("failures", p.execNestFailures).
+					Stringer("wait", wait.Round(time.Millisecond)).
+					Msg("[streams] local nest derived producer backoff")
 			}
 			return err
 		}
@@ -97,6 +108,7 @@ func (p *Producer) Dial() error {
 		p.conn = conn
 		p.state = stateMedias
 		p.recoveringUntil = time.Time{}
+		p.clearExecNestBackoffLocked()
 	}
 
 	return nil
@@ -398,6 +410,7 @@ func (p *Producer) reconnect(workerID, retry int) {
 	_ = p.conn.Stop()
 	// swap connections
 	p.conn = conn
+	p.clearExecNestBackoffLocked()
 
 	go p.worker(conn, workerID)
 }
@@ -435,6 +448,33 @@ func (p *Producer) reconnectBackoff(retry int, err error) time.Duration {
 	}
 
 	return timeout
+}
+
+func (p *Producer) markExecNestBackoffLocked() time.Duration {
+	now := time.Now()
+	if p.execNestLastFail.IsZero() || now.Sub(p.execNestLastFail) > execNestBackoffWindow {
+		p.execNestFailures = 0
+	}
+	p.execNestFailures++
+	p.execNestLastFail = now
+
+	timeout := execNestResetBackoff
+	switch {
+	case p.execNestFailures >= 10:
+		timeout = execNestBackoffMax
+	case p.execNestFailures >= 6:
+		timeout = execNestBackoffLong
+	case p.execNestFailures >= 3:
+		timeout = execNestBackoffMedium
+	}
+	p.recoveringUntil = now.Add(timeout)
+
+	return timeout
+}
+
+func (p *Producer) clearExecNestBackoffLocked() {
+	p.execNestFailures = 0
+	p.execNestLastFail = time.Time{}
 }
 
 func (p *Producer) hasReaders() bool {
