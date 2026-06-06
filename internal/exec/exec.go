@@ -76,6 +76,9 @@ const (
 	localNestStablePublishWindow  = 45 * time.Second
 	localNestMediaReadyTimeout    = 15 * time.Second
 	localNestMediaReadyCheck      = 500 * time.Millisecond
+	localNestMediaReadyStable     = 3 * time.Second
+	localNestMediaReadyMinPackets = 3
+	localNestProbeMinPackets      = 3
 	localNestStartTimeout         = 90 * time.Second
 	localNestRecoveryStartWaitMax = 10 * time.Second
 	localNestProbeFailureWeight   = 2
@@ -438,6 +441,9 @@ func waitLocalNestMediaReady(name string, cmd *shell.Command) error {
 	ticker := time.NewTicker(localNestMediaReadyCheck)
 	defer ticker.Stop()
 
+	var readySince time.Time
+	var readyPackets int
+
 	log.Warn().
 		Int("medias", start.Medias).
 		Int("receivers", start.Receivers).
@@ -447,14 +453,26 @@ func waitLocalNestMediaReady(name string, cmd *shell.Command) error {
 
 	for {
 		status := streams.SourceSchemeStatusForStream(name, "nest")
-		if status.Handled && status.Medias > 0 && status.Receivers > 0 && status.Packets > start.Packets {
-			log.Info().
-				Int("medias", status.Medias).
-				Int("receivers", status.Receivers).
-				Int("packets_start", start.Packets).
-				Int("packets_now", status.Packets).
-				Msg("[exec] local nest upstream media ready")
-			return nil
+		if localNestMediaProgress(status, start.Packets, localNestMediaReadyMinPackets, true) {
+			if readySince.IsZero() {
+				readySince = time.Now()
+				readyPackets = status.Packets
+			} else if time.Since(readySince) >= localNestMediaReadyStable && status.Packets > readyPackets {
+				log.Info().
+					Int("medias", status.Medias).
+					Int("receivers", status.Receivers).
+					Int("packets_start", start.Packets).
+					Int("packets_now", status.Packets).
+					Int("packet_delta", status.Packets-start.Packets).
+					Stringer("stable_for", time.Since(readySince).Round(time.Millisecond)).
+					Msg("[exec] local nest upstream media ready")
+				return nil
+			} else if status.Packets > readyPackets {
+				readyPackets = status.Packets
+			}
+		} else {
+			readySince = time.Time{}
+			readyPackets = 0
 		}
 
 		select {
@@ -479,6 +497,20 @@ func waitLocalNestMediaReady(name string, cmd *shell.Command) error {
 		case <-ticker.C:
 		}
 	}
+}
+
+func localNestMediaProgress(status streams.SourceSchemeStatus, startPackets int, minPackets int, requireReceivers bool) bool {
+	if !status.Handled || status.Medias <= 0 {
+		return false
+	}
+	if requireReceivers && status.Receivers <= 0 {
+		return false
+	}
+	return status.Packets >= startPackets+minPackets
+}
+
+func localNestMediaReadyForRecovery(status streams.SourceSchemeStatus, startPackets int) bool {
+	return localNestMediaProgress(status, startPackets, localNestProbeMinPackets, true)
 }
 
 func waitLocalNestRecovery(name string) error {
@@ -522,7 +554,7 @@ func markLocalNestPublished(name string, reason string) {
 		return
 	}
 
-	mediaReady := status.Handled && status.Medias > 0 && status.Packets > st.packets
+	mediaReady := localNestMediaReadyForRecovery(status, st.packets)
 	if st.failures < 2 && mediaReady {
 		delete(localNestRecovery.state, name)
 		localNestRecovery.Unlock()
@@ -550,6 +582,7 @@ func markLocalNestPublished(name string, reason string) {
 		Int("medias", status.Medias).
 		Int("receivers", status.Receivers).
 		Int("packets", status.Packets).
+		Int("packet_delta", status.Packets-st.packets).
 		Stringer("probe", localNestStablePublishWindow).
 		Msg("[exec] local nest upstream publish probe started")
 
@@ -566,14 +599,14 @@ func completeLocalNestPublishProbe(name string, reason string, publishID uint64)
 	localNestRecovery.Lock()
 	st, ok := localNestRecovery.state[name]
 	stablePublish := ok && st.publishID == publishID && time.Since(st.lastFailure) >= localNestStablePublishWindow
-	mediaReady := status.Handled && status.Medias > 0 && status.Packets > st.packets
+	mediaReady := localNestMediaReadyForRecovery(status, st.packets)
 	if stablePublish && mediaReady {
 		delete(localNestRecovery.state, name)
 	} else if ok && st.publishID == publishID {
 		st.failures += localNestProbeFailureWeight
 		st.probeFailures++
 		st.lastFailure = now
-		wait := localNestRecoveryWindow(st.failures, st.probeFailures, !status.Handled || status.Medias == 0)
+		wait := localNestRecoveryWindow(st.failures, st.probeFailures, !status.Handled || status.Medias == 0 || status.Receivers == 0)
 		st.until = now.Add(wait)
 		hardReset = st.probeFailures >= localNestProbeHardResetAfter
 		localNestRecovery.state[name] = st
@@ -595,6 +628,7 @@ func completeLocalNestPublishProbe(name string, reason string, publishID uint64)
 			Int("receivers", status.Receivers).
 			Int("packets_start", st.packets).
 			Int("packets_now", status.Packets).
+			Int("packet_delta", status.Packets-st.packets).
 			Int("failures", st.failures).
 			Int("probe_failures", st.probeFailures).
 			Stringer("wait", time.Until(st.until).Round(time.Millisecond)).
