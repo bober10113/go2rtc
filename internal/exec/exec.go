@@ -83,6 +83,7 @@ const (
 	localNestRecoveryStartWaitMax = 10 * time.Second
 	localNestProbeFailureWeight   = 2
 	localNestProbeHardResetAfter  = 2
+	localNestHandoffHold          = 2 * time.Minute
 )
 
 var errLocalNestUpstreamReset = errors.New("exec: local nest upstream reset")
@@ -284,6 +285,7 @@ func handleRTSP(source string, cmd *shell.Command, path string, timeout time.Dur
 				}
 				return nil, err
 			}
+			streams.HoldSourceScheme(localNestName, "nest", "exec derived handoff", localNestHandoffHold)
 			markLocalNestPublished(localNestName, "exec published")
 		}
 		log.Debug().Stringer("launch", time.Since(ts)).Msg("[exec] run rtsp")
@@ -569,6 +571,7 @@ func markLocalNestPublished(name string, reason string) {
 
 	st.publishID++
 	publishID := st.publishID
+	startPackets := st.packets
 	st.packets = status.Packets
 	st.until = now.Add(localNestStablePublishWindow)
 	localNestRecovery.state[name] = st
@@ -582,7 +585,7 @@ func markLocalNestPublished(name string, reason string) {
 		Int("medias", status.Medias).
 		Int("receivers", status.Receivers).
 		Int("packets", status.Packets).
-		Int("packet_delta", status.Packets-st.packets).
+		Int("packet_delta", status.Packets-startPackets).
 		Stringer("probe", localNestStablePublishWindow).
 		Msg("[exec] local nest upstream publish probe started")
 

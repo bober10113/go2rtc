@@ -291,6 +291,47 @@ func ResetIfSourceSchemeDetailed(name, scheme, reason string) (bool, bool, bool)
 	return handled, changed, inactive
 }
 
+func HoldSourceScheme(name, scheme, reason string, duration time.Duration) bool {
+	stream := Get(name)
+	if stream == nil || duration <= 0 {
+		return false
+	}
+
+	stream.mu.Lock()
+	producers := append([]*Producer(nil), stream.producers...)
+	stream.mu.Unlock()
+
+	var held bool
+	for _, producer := range producers {
+		if producer.hasSourceScheme(scheme) && producer.hold(reason, duration) {
+			held = true
+		}
+	}
+
+	return held
+}
+
+func (p *Producer) hold(reason string, duration time.Duration) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.conn == nil || p.state == stateNone {
+		return false
+	}
+
+	until := time.Now().Add(duration)
+	if p.recoveringUntil.Before(until) {
+		p.recoveringUntil = until
+	}
+
+	log.Warn().
+		Str("url", safeProducerURL(p.url)).
+		Str("reason", reason).
+		Stringer("hold", duration.Round(time.Millisecond)).
+		Msg("[streams] hold producer during local nest handoff")
+	return true
+}
+
 func SourceSchemeStatusForStream(name, scheme string) SourceSchemeStatus {
 	stream := Get(name)
 	if stream == nil {
