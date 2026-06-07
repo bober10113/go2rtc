@@ -3,11 +3,13 @@ package streams
 import (
 	"encoding/json"
 	"errors"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/core"
+	"github.com/AlexxIT/go2rtc/pkg/shell"
 )
 
 type state byte
@@ -54,6 +56,11 @@ const (
 	execNestIdleRecoveryMax  = 2 * time.Minute
 	deferredStopPadding      = 2 * time.Second
 	execNestResetError       = "exec: local nest upstream reset"
+
+	execNestDerivedWarmupTimeout    = 8 * time.Second
+	execNestDerivedWarmupCheck      = 500 * time.Millisecond
+	execNestDerivedWarmupStable     = 2 * time.Second
+	execNestDerivedWarmupMinPackets = 5
 )
 
 type SourceSchemeStatus struct {
@@ -221,6 +228,137 @@ func (p *Producer) sourceSchemeStatus(scheme string) SourceSchemeStatus {
 	}
 
 	return status
+}
+
+func (p *Producer) waitLocalNestDerivedWarmup() error {
+	if _, ok := p.localNestDerivedInput(); !ok {
+		return nil
+	}
+
+	startMedias, startPackets := p.videoPacketStatus()
+	deadline := time.NewTimer(execNestDerivedWarmupTimeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(execNestDerivedWarmupCheck)
+	defer ticker.Stop()
+
+	var (
+		readySince   time.Time
+		readyPackets int
+		medias       int
+		packets      int
+	)
+
+	log.Warn().
+		Str("url", safeProducerURL(p.url)).
+		Stringer("timeout", execNestDerivedWarmupTimeout).
+		Int("video_medias", startMedias).
+		Int("packets", startPackets).
+		Msg("[streams] waiting for local nest derived media")
+
+	for {
+		medias, packets = p.videoPacketStatus()
+		if medias > 0 && packets >= startPackets+execNestDerivedWarmupMinPackets {
+			if readySince.IsZero() {
+				readySince = time.Now()
+				readyPackets = packets
+			} else if time.Since(readySince) >= execNestDerivedWarmupStable && packets > readyPackets {
+				log.Info().
+					Str("url", safeProducerURL(p.url)).
+					Int("video_medias", medias).
+					Int("packets_start", startPackets).
+					Int("packets_now", packets).
+					Int("packet_delta", packets-startPackets).
+					Stringer("stable_for", time.Since(readySince).Round(time.Millisecond)).
+					Msg("[streams] local nest derived media ready")
+				return nil
+			} else if packets > readyPackets {
+				readyPackets = packets
+			}
+		} else {
+			readySince = time.Time{}
+			readyPackets = 0
+		}
+
+		select {
+		case <-deadline.C:
+			p.mu.Lock()
+			wait := p.markExecNestBackoffLocked()
+			p.mu.Unlock()
+			log.Warn().
+				Str("url", safeProducerURL(p.url)).
+				Int("video_medias", medias).
+				Int("packets_start", startPackets).
+				Int("packets_now", packets).
+				Int("packet_delta", packets-startPackets).
+				Stringer("backoff", wait.Round(time.Millisecond)).
+				Msg("[streams] local nest derived media timeout")
+			return errors.New(execNestResetError)
+		case <-ticker.C:
+		}
+	}
+}
+
+func (p *Producer) videoPacketStatus() (medias, packets int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.conn != nil {
+		for _, media := range p.conn.GetMedias() {
+			if media.Direction == core.DirectionRecvonly && media.Kind == core.KindVideo && len(media.Codecs) > 0 {
+				medias++
+			}
+		}
+	}
+
+	for _, receiver := range p.receivers {
+		if receiver == nil || receiver.Codec == nil || core.GetKind(receiver.Codec.Name) != core.KindVideo {
+			continue
+		}
+		packets += receiver.Packets
+	}
+
+	return medias, packets
+}
+
+func (p *Producer) localNestDerivedInput() (string, bool) {
+	if !strings.HasPrefix(p.url, "exec:") {
+		return "", false
+	}
+
+	args := shell.QuoteSplit(strings.TrimPrefix(p.url, "exec:"))
+	for i := 0; i < len(args)-1; i++ {
+		if args[i] != "-i" {
+			continue
+		}
+		name, ok := localNestRTSPInputName(args[i+1])
+		if !ok {
+			continue
+		}
+		if status := SourceSchemeStatusForStream(name, "nest"); status.Handled {
+			return name, true
+		}
+	}
+
+	return "", false
+}
+
+func localNestRTSPInputName(rawURL string) (string, bool) {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Scheme != "rtsp" || u.Path == "" {
+		return "", false
+	}
+
+	host := u.Hostname()
+	if host != "127.0.0.1" && host != "localhost" && host != "::1" {
+		return "", false
+	}
+
+	name := strings.TrimPrefix(u.Path, "/")
+	if name == "" {
+		return "", false
+	}
+
+	return name, true
 }
 
 func (p *Producer) reset(reason string) (bool, bool, bool) {

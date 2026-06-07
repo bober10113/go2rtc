@@ -107,8 +107,20 @@ func (s *Stream) AddConsumer(cons core.Consumer) (err error) {
 	s.mu.Unlock()
 
 	// there may be duplicates, but that's not a problem
+	started := make(map[*Producer]struct{}, len(prodStarts))
 	for _, prod := range prodStarts {
+		if _, ok := started[prod]; ok {
+			continue
+		}
+		started[prod] = struct{}{}
 		prod.start()
+	}
+
+	for prod := range started {
+		if err = prod.waitLocalNestDerivedWarmup(); err != nil {
+			s.RemoveConsumer(cons)
+			return err
+		}
 	}
 
 	return nil
