@@ -321,6 +321,10 @@ func (p *Producer) videoPacketStatus() (medias, packets int) {
 }
 
 func (p *Producer) localNestDerivedInput() (string, bool) {
+	if strings.HasPrefix(p.url, "ffmpeg:") {
+		return p.localNestFFmpegInput()
+	}
+
 	if !strings.HasPrefix(p.url, "exec:") {
 		return "", false
 	}
@@ -337,6 +341,33 @@ func (p *Producer) localNestDerivedInput() (string, bool) {
 		if status := SourceSchemeStatusForStream(name, "nest"); status.Handled {
 			return name, true
 		}
+	}
+
+	return "", false
+}
+
+func (p *Producer) localNestFFmpegInput() (string, bool) {
+	source := strings.TrimPrefix(p.url, "ffmpeg:")
+	source, _, _ = strings.Cut(source, "#")
+
+	if name, ok := localNestRTSPInputName(source); ok {
+		if status := SourceSchemeStatusForStream(name, "nest"); status.Handled {
+			return name, true
+		}
+		return "", false
+	}
+
+	if strings.Contains(source, "://") {
+		return "", false
+	}
+
+	name := strings.TrimSpace(source)
+	if name == "" {
+		return "", false
+	}
+
+	if status := SourceSchemeStatusForStream(name, "nest"); status.Handled {
+		return name, true
 	}
 
 	return "", false
