@@ -390,7 +390,7 @@ func markLocalNestRecovery(name string, reason string, inactive bool) time.Durat
 
 func localNestRecoveryWindow(failures int, probeFailures int, inactive bool) time.Duration {
 	wait := localNestRecoveryWindowBase
-	if inactive {
+	if inactive && failures <= 1 && probeFailures == 0 {
 		return localNestInactiveRecovery
 	}
 	switch {
