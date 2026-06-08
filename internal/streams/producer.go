@@ -61,6 +61,12 @@ const (
 	execNestDerivedWarmupCheck      = 500 * time.Millisecond
 	execNestDerivedWarmupStable     = 2 * time.Second
 	execNestDerivedWarmupMinPackets = 5
+	execNestDerivedFlapTimeout      = 20 * time.Second
+	execNestDerivedFlapStable       = 5 * time.Second
+	execNestDerivedFlapMinPackets   = 25
+	execNestDerivedHardTimeout      = 45 * time.Second
+	execNestDerivedHardStable       = 10 * time.Second
+	execNestDerivedHardMinPackets   = 60
 )
 
 type SourceSchemeStatus struct {
@@ -115,7 +121,9 @@ func (p *Producer) Dial() error {
 		p.conn = conn
 		p.state = stateMedias
 		p.recoveringUntil = time.Time{}
-		p.clearExecNestBackoffLocked()
+		if _, ok := p.localNestDerivedInput(); !ok {
+			p.clearExecNestBackoffLocked()
+		}
 	}
 
 	return nil
@@ -235,8 +243,13 @@ func (p *Producer) waitLocalNestDerivedWarmup() error {
 		return nil
 	}
 
+	p.mu.Lock()
+	failures := p.recentExecNestFailuresLocked(time.Now())
+	p.mu.Unlock()
+
+	timeout, stableFor, minPackets := execNestDerivedWarmupPolicy(failures)
 	startMedias, startPackets := p.videoPacketStatus()
-	deadline := time.NewTimer(execNestDerivedWarmupTimeout)
+	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
 	ticker := time.NewTicker(execNestDerivedWarmupCheck)
 	defer ticker.Stop()
@@ -250,20 +263,27 @@ func (p *Producer) waitLocalNestDerivedWarmup() error {
 
 	log.Warn().
 		Str("url", safeProducerURL(p.url)).
-		Stringer("timeout", execNestDerivedWarmupTimeout).
+		Int("failures", failures).
+		Stringer("timeout", timeout).
+		Stringer("stable", stableFor).
+		Int("min_packets", minPackets).
 		Int("video_medias", startMedias).
 		Int("packets", startPackets).
 		Msg("[streams] waiting for local nest derived media")
 
 	for {
 		medias, packets = p.videoPacketStatus()
-		if medias > 0 && packets >= startPackets+execNestDerivedWarmupMinPackets {
+		if medias > 0 && packets >= startPackets+minPackets {
 			if readySince.IsZero() {
 				readySince = time.Now()
 				readyPackets = packets
-			} else if time.Since(readySince) >= execNestDerivedWarmupStable && packets > readyPackets {
+			} else if time.Since(readySince) >= stableFor && packets > readyPackets {
+				p.mu.Lock()
+				p.clearExecNestBackoffLocked()
+				p.mu.Unlock()
 				log.Info().
 					Str("url", safeProducerURL(p.url)).
+					Int("failures", failures).
 					Int("video_medias", medias).
 					Int("packets_start", startPackets).
 					Int("packets_now", packets).
@@ -283,6 +303,7 @@ func (p *Producer) waitLocalNestDerivedWarmup() error {
 		case <-deadline.C:
 			p.mu.Lock()
 			wait := p.markExecNestBackoffLocked()
+			failures := p.execNestFailures
 			p.mu.Unlock()
 			log.Warn().
 				Str("url", safeProducerURL(p.url)).
@@ -291,6 +312,7 @@ func (p *Producer) waitLocalNestDerivedWarmup() error {
 				Int("packets_now", packets).
 				Int("packet_delta", packets-startPackets).
 				Stringer("backoff", wait.Round(time.Millisecond)).
+				Int("failures", failures).
 				Msg("[streams] local nest derived media timeout")
 			return errors.New(execNestResetError)
 		case <-ticker.C:
@@ -318,6 +340,25 @@ func (p *Producer) videoPacketStatus() (medias, packets int) {
 	}
 
 	return medias, packets
+}
+
+func execNestDerivedWarmupPolicy(failures int) (timeout time.Duration, stable time.Duration, minPackets int) {
+	timeout = execNestDerivedWarmupTimeout
+	stable = execNestDerivedWarmupStable
+	minPackets = execNestDerivedWarmupMinPackets
+
+	switch {
+	case failures >= 6:
+		timeout = execNestDerivedHardTimeout
+		stable = execNestDerivedHardStable
+		minPackets = execNestDerivedHardMinPackets
+	case failures >= 2:
+		timeout = execNestDerivedFlapTimeout
+		stable = execNestDerivedFlapStable
+		minPackets = execNestDerivedFlapMinPackets
+	}
+
+	return
 }
 
 func (p *Producer) localNestDerivedInput() (string, bool) {
@@ -680,6 +721,13 @@ func (p *Producer) markExecNestBackoffLocked() time.Duration {
 	p.recoveringUntil = now.Add(timeout)
 
 	return timeout
+}
+
+func (p *Producer) recentExecNestFailuresLocked(now time.Time) int {
+	if p.execNestLastFail.IsZero() || now.Sub(p.execNestLastFail) > execNestBackoffWindow {
+		return 0
+	}
+	return p.execNestFailures
 }
 
 func (p *Producer) clearExecNestBackoffLocked() {
