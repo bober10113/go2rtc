@@ -557,18 +557,6 @@ func markLocalNestPublished(name string, reason string) {
 	}
 
 	mediaReady := localNestMediaReadyForRecovery(status, st.packets)
-	if st.failures < 2 && mediaReady {
-		delete(localNestRecovery.state, name)
-		localNestRecovery.Unlock()
-		log.Info().
-			Str("reason", reason).
-			Int("medias", status.Medias).
-			Int("receivers", status.Receivers).
-			Int("packets", status.Packets).
-			Msg("[exec] local nest upstream recovered")
-		return
-	}
-
 	if st.publishID != 0 && now.Before(st.until) {
 		st.failures += localNestProbeFailureWeight
 		st.probeFailures++
