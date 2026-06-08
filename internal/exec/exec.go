@@ -569,6 +569,41 @@ func markLocalNestPublished(name string, reason string) {
 		return
 	}
 
+	if st.publishID != 0 && now.Before(st.until) {
+		st.failures += localNestProbeFailureWeight
+		st.probeFailures++
+		st.lastFailure = now
+		wait := localNestRecoveryWindow(st.failures, st.probeFailures, !mediaReady)
+		st.until = now.Add(wait)
+		hardReset := st.probeFailures >= localNestProbeHardResetAfter
+		localNestRecovery.state[name] = st
+		localNestRecovery.Unlock()
+
+		log.Warn().
+			Str("reason", reason).
+			Int("failures", st.failures).
+			Int("probe_failures", st.probeFailures).
+			Bool("media_ready", mediaReady).
+			Int("medias", status.Medias).
+			Int("receivers", status.Receivers).
+			Int("packets", status.Packets).
+			Stringer("wait", wait.Round(time.Millisecond)).
+			Msg("[exec] local nest upstream republished during active probe")
+
+		if hardReset {
+			handled, changed, inactive := streams.ResetIfSourceSchemeDetailed(name, "nest", "exec repeated publish during probe")
+			log.Warn().
+				Str("reason", reason).
+				Bool("handled", handled).
+				Bool("changed", changed).
+				Bool("inactive", inactive).
+				Int("failures", st.failures).
+				Int("probe_failures", st.probeFailures).
+				Msg("[exec] local nest upstream hard reset requested")
+		}
+		return
+	}
+
 	st.publishID++
 	publishID := st.publishID
 	startPackets := st.packets
