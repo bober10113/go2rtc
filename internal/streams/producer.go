@@ -67,6 +67,7 @@ const (
 	execNestDerivedHardTimeout      = 45 * time.Second
 	execNestDerivedHardStable       = 10 * time.Second
 	execNestDerivedHardMinPackets   = 60
+	execNestDerivedRawResetAfter    = 3
 )
 
 type SourceSchemeStatus struct {
@@ -239,7 +240,8 @@ func (p *Producer) sourceSchemeStatus(scheme string) SourceSchemeStatus {
 }
 
 func (p *Producer) waitLocalNestDerivedWarmup() error {
-	if _, ok := p.localNestDerivedInput(); !ok {
+	inputName, ok := p.localNestDerivedInput()
+	if !ok {
 		return nil
 	}
 
@@ -305,14 +307,25 @@ func (p *Producer) waitLocalNestDerivedWarmup() error {
 			wait := p.markExecNestBackoffLocked()
 			failures := p.execNestFailures
 			p.mu.Unlock()
+
+			resetRaw := execNestShouldResetRawAfterDerivedFailure(failures)
+			handled, changed, inactive := false, false, false
+			if resetRaw {
+				handled, changed, inactive = ResetIfSourceSchemeDetailed(inputName, "nest", "derived media timeout")
+			}
 			log.Warn().
 				Str("url", safeProducerURL(p.url)).
+				Str("derived_input", inputName).
 				Int("video_medias", medias).
 				Int("packets_start", startPackets).
 				Int("packets_now", packets).
 				Int("packet_delta", packets-startPackets).
 				Stringer("backoff", wait.Round(time.Millisecond)).
 				Int("failures", failures).
+				Bool("reset_raw", resetRaw).
+				Bool("raw_handled", handled).
+				Bool("raw_changed", changed).
+				Bool("raw_inactive", inactive).
 				Msg("[streams] local nest derived media timeout")
 			return errors.New(execNestResetError)
 		case <-ticker.C:
@@ -359,6 +372,10 @@ func execNestDerivedWarmupPolicy(failures int) (timeout time.Duration, stable ti
 	}
 
 	return
+}
+
+func execNestShouldResetRawAfterDerivedFailure(failures int) bool {
+	return failures >= execNestDerivedRawResetAfter
 }
 
 func (p *Producer) localNestDerivedInput() (string, bool) {

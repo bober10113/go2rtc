@@ -39,3 +39,13 @@ func TestRecentExecNestFailuresIgnoresStaleFailures(t *testing.T) {
 		t.Fatalf("recent failures = %d, want 4", got)
 	}
 }
+
+func TestExecNestShouldResetRawAfterDerivedFailure(t *testing.T) {
+	if execNestShouldResetRawAfterDerivedFailure(execNestDerivedRawResetAfter - 1) {
+		t.Fatalf("raw reset triggered before threshold")
+	}
+
+	if !execNestShouldResetRawAfterDerivedFailure(execNestDerivedRawResetAfter) {
+		t.Fatalf("raw reset did not trigger at threshold")
+	}
+}
