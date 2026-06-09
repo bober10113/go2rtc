@@ -77,6 +77,20 @@ type SourceSchemeStatus struct {
 	Packets   int
 }
 
+type execNestDerivedRecoveryCall struct {
+	done    chan struct{}
+	started time.Time
+	err     error
+	waiters int
+}
+
+var execNestDerivedRecovery = struct {
+	sync.Mutex
+	calls map[string]*execNestDerivedRecoveryCall
+}{
+	calls: map[string]*execNestDerivedRecoveryCall{},
+}
+
 func NewProducer(source string) *Producer {
 	if strings.Contains(source, SourceTemplate) {
 		return &Producer{template: source}
@@ -245,6 +259,37 @@ func (p *Producer) waitLocalNestDerivedWarmup() error {
 		return nil
 	}
 
+	call, owner, waiters, age := beginExecNestDerivedRecovery(inputName, time.Now())
+	if !owner {
+		log.Warn().
+			Str("url", safeProducerURL(p.url)).
+			Str("derived_input", inputName).
+			Int("waiters", waiters).
+			Stringer("existing_recovery_age", age.Round(time.Millisecond)).
+			Bool("recovery_owner", false).
+			Msg("[streams] join local nest derived media recovery")
+		<-call.done
+		if call.err != nil {
+			return call.err
+		}
+		if medias, packets := p.videoPacketStatus(); medias > 0 && packets > 0 {
+			return nil
+		}
+		log.Warn().
+			Str("url", safeProducerURL(p.url)).
+			Str("derived_input", inputName).
+			Int("waiters", waiters).
+			Bool("recovery_owner", false).
+			Msg("[streams] local nest derived recovery waiter has no media")
+		return errors.New(execNestResetError)
+	}
+
+	err := p.waitLocalNestDerivedWarmupOwner(inputName)
+	finishExecNestDerivedRecovery(inputName, call, err)
+	return err
+}
+
+func (p *Producer) waitLocalNestDerivedWarmupOwner(inputName string) error {
 	p.mu.Lock()
 	failures := p.recentExecNestFailuresLocked(time.Now())
 	p.mu.Unlock()
@@ -271,6 +316,7 @@ func (p *Producer) waitLocalNestDerivedWarmup() error {
 		Int("min_packets", minPackets).
 		Int("video_medias", startMedias).
 		Int("packets", startPackets).
+		Bool("recovery_owner", true).
 		Msg("[streams] waiting for local nest derived media")
 
 	for {
@@ -291,6 +337,7 @@ func (p *Producer) waitLocalNestDerivedWarmup() error {
 					Int("packets_now", packets).
 					Int("packet_delta", packets-startPackets).
 					Stringer("stable_for", time.Since(readySince).Round(time.Millisecond)).
+					Bool("recovery_owner", true).
 					Msg("[streams] local nest derived media ready")
 				return nil
 			} else if packets > readyPackets {
@@ -326,11 +373,44 @@ func (p *Producer) waitLocalNestDerivedWarmup() error {
 				Bool("raw_handled", handled).
 				Bool("raw_changed", changed).
 				Bool("raw_inactive", inactive).
+				Bool("recovery_owner", true).
 				Msg("[streams] local nest derived media timeout")
 			return errors.New(execNestResetError)
 		case <-ticker.C:
 		}
 	}
+}
+
+func beginExecNestDerivedRecovery(inputName string, now time.Time) (*execNestDerivedRecoveryCall, bool, int, time.Duration) {
+	execNestDerivedRecovery.Lock()
+	defer execNestDerivedRecovery.Unlock()
+
+	if execNestDerivedRecovery.calls == nil {
+		execNestDerivedRecovery.calls = map[string]*execNestDerivedRecoveryCall{}
+	}
+
+	if call := execNestDerivedRecovery.calls[inputName]; call != nil {
+		call.waiters++
+		return call, false, call.waiters, now.Sub(call.started)
+	}
+
+	call := &execNestDerivedRecoveryCall{
+		done:    make(chan struct{}),
+		started: now,
+	}
+	execNestDerivedRecovery.calls[inputName] = call
+	return call, true, 0, 0
+}
+
+func finishExecNestDerivedRecovery(inputName string, call *execNestDerivedRecoveryCall, err error) {
+	execNestDerivedRecovery.Lock()
+	defer execNestDerivedRecovery.Unlock()
+
+	if execNestDerivedRecovery.calls[inputName] == call {
+		delete(execNestDerivedRecovery.calls, inputName)
+	}
+	call.err = err
+	close(call.done)
 }
 
 func (p *Producer) videoPacketStatus() (medias, packets int) {

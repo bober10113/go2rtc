@@ -1,6 +1,7 @@
 package streams
 
 import (
+	"errors"
 	"testing"
 	"time"
 )
@@ -48,4 +49,59 @@ func TestExecNestShouldResetRawAfterDerivedFailure(t *testing.T) {
 	if !execNestShouldResetRawAfterDerivedFailure(execNestDerivedRawResetAfter) {
 		t.Fatalf("raw reset did not trigger at threshold")
 	}
+}
+
+func TestBeginExecNestDerivedRecoverySingleFlight(t *testing.T) {
+	resetExecNestDerivedRecoveryForTest()
+	defer resetExecNestDerivedRecoveryForTest()
+
+	start := time.Now()
+	first, owner, waiters, age := beginExecNestDerivedRecovery("nest_raw", start)
+	if !owner {
+		t.Fatalf("first recovery was not owner")
+	}
+	if waiters != 0 || age != 0 {
+		t.Fatalf("first recovery waiters=%d age=%s, want 0", waiters, age)
+	}
+
+	second, owner, waiters, age := beginExecNestDerivedRecovery("nest_raw", start.Add(2*time.Second))
+	if owner {
+		t.Fatalf("duplicate recovery became owner")
+	}
+	if second != first {
+		t.Fatalf("duplicate recovery did not join first call")
+	}
+	if waiters != 1 || age != 2*time.Second {
+		t.Fatalf("duplicate recovery waiters=%d age=%s, want waiters=1 age=2s", waiters, age)
+	}
+
+	errDone := errors.New("done")
+	finishExecNestDerivedRecovery("nest_raw", first, errDone)
+
+	select {
+	case <-second.done:
+	default:
+		t.Fatalf("duplicate recovery was not released")
+	}
+	if !errors.Is(second.err, errDone) {
+		t.Fatalf("duplicate recovery err=%v, want %v", second.err, errDone)
+	}
+
+	next, owner, waiters, _ := beginExecNestDerivedRecovery("nest_raw", start.Add(3*time.Second))
+	if !owner {
+		t.Fatalf("new recovery after finish was not owner")
+	}
+	if next == first {
+		t.Fatalf("new recovery reused finished call")
+	}
+	if waiters != 0 {
+		t.Fatalf("new recovery waiters=%d, want 0", waiters)
+	}
+	finishExecNestDerivedRecovery("nest_raw", next, nil)
+}
+
+func resetExecNestDerivedRecoveryForTest() {
+	execNestDerivedRecovery.Lock()
+	defer execNestDerivedRecovery.Unlock()
+	execNestDerivedRecovery.calls = map[string]*execNestDerivedRecoveryCall{}
 }
