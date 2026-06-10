@@ -33,14 +33,16 @@ type Producer struct {
 	receivers []*core.Receiver
 	senders   []*core.Receiver
 
-	state            state
-	mu               sync.Mutex
-	workerID         int
-	lastReset        time.Time
-	execNestFailures int
-	execNestLastFail time.Time
-	recoveringUntil  time.Time
-	idleRecoverUntil time.Time
+	state             state
+	mu                sync.Mutex
+	workerID          int
+	lastReset         time.Time
+	execNestFailures  int
+	execNestLastFail  time.Time
+	execNestStarts    int
+	execNestLastStart time.Time
+	recoveringUntil   time.Time
+	idleRecoverUntil  time.Time
 }
 
 const SourceTemplate = "{input}"
@@ -67,6 +69,11 @@ const (
 	execNestDerivedHardTimeout      = 45 * time.Second
 	execNestDerivedHardStable       = 10 * time.Second
 	execNestDerivedHardMinPackets   = 60
+	execNestDerivedStartWindow      = 5 * time.Minute
+	execNestDerivedStartFlapAfter   = 2
+	execNestDerivedStartHardAfter   = 3
+	execNestDerivedFlapSettle       = 5 * time.Second
+	execNestDerivedHardSettle       = 10 * time.Second
 	execNestDerivedRawResetAfter    = 3
 )
 
@@ -290,12 +297,31 @@ func (p *Producer) waitLocalNestDerivedWarmup() error {
 }
 
 func (p *Producer) waitLocalNestDerivedWarmupOwner(inputName string) error {
+	now := time.Now()
 	p.mu.Lock()
-	failures := p.recentExecNestFailuresLocked(time.Now())
+	if wait := p.recoveringUntil.Sub(now); wait > 0 {
+		p.mu.Unlock()
+		log.Warn().
+			Str("url", safeProducerURL(p.url)).
+			Str("derived_input", inputName).
+			Stringer("wait", wait.Round(time.Millisecond)).
+			Msg("[streams] wait local nest derived recovery hold")
+		return errors.New(execNestResetError)
+	}
+	failures := p.recentExecNestFailuresLocked(now)
 	p.mu.Unlock()
 
-	timeout, stableFor, minPackets := execNestDerivedWarmupPolicy(failures)
 	startMedias, startPackets := p.videoPacketStatus()
+	recentStarts := 0
+	if startPackets == 0 {
+		p.mu.Lock()
+		recentStarts = p.markExecNestDerivedStartLocked(now)
+		p.mu.Unlock()
+	}
+
+	severity := execNestDerivedWarmupSeverity(failures, recentStarts)
+	timeout, stableFor, minPackets := execNestDerivedWarmupPolicy(severity)
+	settleFor := execNestDerivedSettleDelay(severity)
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
 	ticker := time.NewTicker(execNestDerivedWarmupCheck)
@@ -311,8 +337,11 @@ func (p *Producer) waitLocalNestDerivedWarmupOwner(inputName string) error {
 	log.Warn().
 		Str("url", safeProducerURL(p.url)).
 		Int("failures", failures).
+		Int("recent_starts", recentStarts).
+		Int("severity", severity).
 		Stringer("timeout", timeout).
 		Stringer("stable", stableFor).
+		Stringer("settle", settleFor).
 		Int("min_packets", minPackets).
 		Int("video_medias", startMedias).
 		Int("packets", startPackets).
@@ -326,9 +355,6 @@ func (p *Producer) waitLocalNestDerivedWarmupOwner(inputName string) error {
 				readySince = time.Now()
 				readyPackets = packets
 			} else if time.Since(readySince) >= stableFor && packets > readyPackets {
-				p.mu.Lock()
-				p.clearExecNestBackoffLocked()
-				p.mu.Unlock()
 				log.Info().
 					Str("url", safeProducerURL(p.url)).
 					Int("failures", failures).
@@ -339,6 +365,12 @@ func (p *Producer) waitLocalNestDerivedWarmupOwner(inputName string) error {
 					Stringer("stable_for", time.Since(readySince).Round(time.Millisecond)).
 					Bool("recovery_owner", true).
 					Msg("[streams] local nest derived media ready")
+				if err := p.waitLocalNestDerivedSettle(inputName, settleFor, packets); err != nil {
+					return err
+				}
+				p.mu.Lock()
+				p.clearExecNestBackoffLocked()
+				p.mu.Unlock()
 				return nil
 			} else if packets > readyPackets {
 				readyPackets = packets
@@ -379,6 +411,69 @@ func (p *Producer) waitLocalNestDerivedWarmupOwner(inputName string) error {
 		case <-ticker.C:
 		}
 	}
+}
+
+func (p *Producer) waitLocalNestDerivedSettle(inputName string, settleFor time.Duration, startPackets int) error {
+	if settleFor <= 0 {
+		return nil
+	}
+
+	deadline := time.NewTimer(settleFor)
+	defer deadline.Stop()
+	ticker := time.NewTicker(execNestDerivedWarmupCheck)
+	defer ticker.Stop()
+
+	lastPackets := startPackets
+	log.Warn().
+		Str("url", safeProducerURL(p.url)).
+		Str("derived_input", inputName).
+		Stringer("settle", settleFor).
+		Int("packets_start", startPackets).
+		Msg("[streams] settling local nest derived media")
+
+	for {
+		select {
+		case <-deadline.C:
+			medias, packets := p.videoPacketStatus()
+			if medias > 0 && packets > startPackets {
+				log.Info().
+					Str("url", safeProducerURL(p.url)).
+					Str("derived_input", inputName).
+					Int("video_medias", medias).
+					Int("packets_start", startPackets).
+					Int("packets_now", packets).
+					Int("packet_delta", packets-startPackets).
+					Stringer("settled_for", settleFor).
+					Msg("[streams] local nest derived media settled")
+				return nil
+			}
+			return p.failLocalNestDerivedSettle(inputName, startPackets, packets, "settle expired without packet growth")
+		case <-ticker.C:
+			medias, packets := p.videoPacketStatus()
+			if medias == 0 || packets <= lastPackets {
+				return p.failLocalNestDerivedSettle(inputName, startPackets, packets, "packets stopped during settle")
+			}
+			lastPackets = packets
+		}
+	}
+}
+
+func (p *Producer) failLocalNestDerivedSettle(inputName string, startPackets, packets int, reason string) error {
+	p.mu.Lock()
+	wait := p.markExecNestBackoffLocked()
+	failures := p.execNestFailures
+	p.mu.Unlock()
+
+	log.Warn().
+		Str("url", safeProducerURL(p.url)).
+		Str("derived_input", inputName).
+		Str("reason", reason).
+		Int("packets_start", startPackets).
+		Int("packets_now", packets).
+		Stringer("backoff", wait.Round(time.Millisecond)).
+		Int("failures", failures).
+		Msg("[streams] local nest derived media settle failed")
+	return errors.New(execNestResetError)
 }
 
 func beginExecNestDerivedRecovery(inputName string, now time.Time) (*execNestDerivedRecoveryCall, bool, int, time.Duration) {
@@ -452,6 +547,32 @@ func execNestDerivedWarmupPolicy(failures int) (timeout time.Duration, stable ti
 	}
 
 	return
+}
+
+func execNestDerivedWarmupSeverity(failures, recentStarts int) int {
+	severity := failures
+	switch {
+	case recentStarts >= execNestDerivedStartHardAfter:
+		if severity < 6 {
+			severity = 6
+		}
+	case recentStarts >= execNestDerivedStartFlapAfter:
+		if severity < 2 {
+			severity = 2
+		}
+	}
+	return severity
+}
+
+func execNestDerivedSettleDelay(severity int) time.Duration {
+	switch {
+	case severity >= 6:
+		return execNestDerivedHardSettle
+	case severity >= 2:
+		return execNestDerivedFlapSettle
+	default:
+		return 0
+	}
 }
 
 func execNestShouldResetRawAfterDerivedFailure(failures int) bool {
@@ -825,6 +946,15 @@ func (p *Producer) recentExecNestFailuresLocked(now time.Time) int {
 		return 0
 	}
 	return p.execNestFailures
+}
+
+func (p *Producer) markExecNestDerivedStartLocked(now time.Time) int {
+	if p.execNestLastStart.IsZero() || now.Sub(p.execNestLastStart) > execNestDerivedStartWindow {
+		p.execNestStarts = 0
+	}
+	p.execNestStarts++
+	p.execNestLastStart = now
+	return p.execNestStarts
 }
 
 func (p *Producer) clearExecNestBackoffLocked() {

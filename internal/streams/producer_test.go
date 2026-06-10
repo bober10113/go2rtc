@@ -51,6 +51,51 @@ func TestExecNestShouldResetRawAfterDerivedFailure(t *testing.T) {
 	}
 }
 
+func TestExecNestDerivedWarmupSeverityUsesRecentStarts(t *testing.T) {
+	if got := execNestDerivedWarmupSeverity(0, 1); got != 0 {
+		t.Fatalf("severity for first start = %d, want 0", got)
+	}
+
+	if got := execNestDerivedWarmupSeverity(0, execNestDerivedStartFlapAfter); got != 2 {
+		t.Fatalf("severity for flap starts = %d, want 2", got)
+	}
+
+	if got := execNestDerivedWarmupSeverity(0, execNestDerivedStartHardAfter); got != 6 {
+		t.Fatalf("severity for hard starts = %d, want 6", got)
+	}
+
+	if got := execNestDerivedWarmupSeverity(4, 1); got != 4 {
+		t.Fatalf("severity did not preserve higher failure count: %d", got)
+	}
+}
+
+func TestExecNestDerivedSettleDelay(t *testing.T) {
+	if got := execNestDerivedSettleDelay(0); got != 0 {
+		t.Fatalf("base settle = %s, want 0", got)
+	}
+	if got := execNestDerivedSettleDelay(2); got != execNestDerivedFlapSettle {
+		t.Fatalf("flap settle = %s, want %s", got, execNestDerivedFlapSettle)
+	}
+	if got := execNestDerivedSettleDelay(6); got != execNestDerivedHardSettle {
+		t.Fatalf("hard settle = %s, want %s", got, execNestDerivedHardSettle)
+	}
+}
+
+func TestMarkExecNestDerivedStartResetsAfterWindow(t *testing.T) {
+	now := time.Now()
+	prod := &Producer{}
+
+	if got := prod.markExecNestDerivedStartLocked(now); got != 1 {
+		t.Fatalf("first recent start = %d, want 1", got)
+	}
+	if got := prod.markExecNestDerivedStartLocked(now.Add(time.Minute)); got != 2 {
+		t.Fatalf("second recent start = %d, want 2", got)
+	}
+	if got := prod.markExecNestDerivedStartLocked(now.Add(time.Minute + execNestDerivedStartWindow + time.Second)); got != 1 {
+		t.Fatalf("stale recent starts were not reset: %d", got)
+	}
+}
+
 func TestBeginExecNestDerivedRecoverySingleFlight(t *testing.T) {
 	resetExecNestDerivedRecoveryForTest()
 	defer resetExecNestDerivedRecoveryForTest()
