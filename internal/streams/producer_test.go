@@ -51,6 +51,20 @@ func TestExecNestShouldResetRawAfterDerivedFailure(t *testing.T) {
 	}
 }
 
+func TestSourceSchemeHasMedia(t *testing.T) {
+	if sourceSchemeHasMedia(SourceSchemeStatus{}) {
+		t.Fatalf("empty status has media")
+	}
+
+	if sourceSchemeHasMedia(SourceSchemeStatus{Handled: true}) {
+		t.Fatalf("handled status without media has media")
+	}
+
+	if !sourceSchemeHasMedia(SourceSchemeStatus{Handled: true, Medias: 1}) {
+		t.Fatalf("handled status with media was not detected")
+	}
+}
+
 func TestExecNestDerivedWarmupSeverityUsesRecentStarts(t *testing.T) {
 	if got := execNestDerivedWarmupSeverity(0, 1); got != 0 {
 		t.Fatalf("severity for first start = %d, want 0", got)

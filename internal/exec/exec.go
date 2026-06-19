@@ -303,6 +303,17 @@ func resetLocalNestInput(args []string, reason string) bool {
 		return false
 	}
 
+	if status, ok := localNestSourceAvailable(name); ok {
+		clearLocalNestRecovery(name)
+		log.Warn().
+			Str("reason", reason).
+			Int("medias", status.Medias).
+			Int("receivers", status.Receivers).
+			Int("packets", status.Packets).
+			Msg("[exec] keep upstream nest stream because media is present")
+		return false
+	}
+
 	if wait := localNestRecoveryWait(name); wait > 0 {
 		log.Warn().
 			Str("reason", reason).
@@ -515,9 +526,34 @@ func localNestMediaReadyForRecovery(status streams.SourceSchemeStatus, startPack
 	return localNestMediaProgress(status, startPackets, localNestProbeMinPackets, true)
 }
 
+func localNestStatusAvailable(status streams.SourceSchemeStatus) bool {
+	return status.Handled && status.Medias > 0
+}
+
+func localNestSourceAvailable(name string) (streams.SourceSchemeStatus, bool) {
+	status := streams.SourceSchemeStatusForStream(name, "nest")
+	return status, localNestStatusAvailable(status)
+}
+
+func clearLocalNestRecovery(name string) {
+	localNestRecovery.Lock()
+	delete(localNestRecovery.state, name)
+	localNestRecovery.Unlock()
+}
+
 func waitLocalNestRecovery(name string) error {
 	wait := localNestRecoveryWait(name)
 	if wait <= 0 {
+		return nil
+	}
+
+	if status, ok := localNestSourceAvailable(name); ok {
+		clearLocalNestRecovery(name)
+		log.Warn().
+			Int("medias", status.Medias).
+			Int("receivers", status.Receivers).
+			Int("packets", status.Packets).
+			Msg("[exec] clear local nest recovery because upstream media is present")
 		return nil
 	}
 

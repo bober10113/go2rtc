@@ -1,6 +1,10 @@
 package exec
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/AlexxIT/go2rtc/internal/streams"
+)
 
 func TestLocalNestRecoveryWindowEscalatesRepeatedInactiveFailures(t *testing.T) {
 	if got := localNestRecoveryWindow(1, 0, true); got != localNestInactiveRecovery {
@@ -23,5 +27,19 @@ func TestLocalNestRecoveryWindowEscalatesRepeatedInactiveFailures(t *testing.T) 
 func TestLocalNestRecoveryWindowEscalatesInactiveProbeFailures(t *testing.T) {
 	if got := localNestRecoveryWindow(1, 2, true); got != localNestFlapRecoveryMin {
 		t.Fatalf("inactive probe failures wait = %s, want %s", got, localNestFlapRecoveryMin)
+	}
+}
+
+func TestLocalNestStatusAvailableUsesMediaPresence(t *testing.T) {
+	if localNestStatusAvailable(streams.SourceSchemeStatus{}) {
+		t.Fatalf("empty status was available")
+	}
+
+	if localNestStatusAvailable(streams.SourceSchemeStatus{Handled: true}) {
+		t.Fatalf("handled status without media was available")
+	}
+
+	if !localNestStatusAvailable(streams.SourceSchemeStatus{Handled: true, Medias: 1}) {
+		t.Fatalf("handled status with media was not available")
 	}
 }
