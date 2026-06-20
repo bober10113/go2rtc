@@ -84,6 +84,10 @@ type SourceSchemeStatus struct {
 	Packets   int
 }
 
+type sourceReceiverStats interface {
+	SourceReceivers() []*core.Receiver
+}
+
 type execNestDerivedRecoveryCall struct {
 	done    chan struct{}
 	started time.Time
@@ -116,13 +120,16 @@ func (p *Producer) SetSource(s string) {
 
 func (p *Producer) Dial() error {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 
-	if p.state == stateNone {
-		if wait := time.Until(p.recoveringUntil); wait > 0 {
-			if inputName, ok := p.localNestDerivedInput(); ok {
-				if status, ok := localNestSourceAvailableForDerived(inputName); ok {
-					p.recoveringUntil = time.Time{}
+	if p.state != stateNone {
+		p.mu.Unlock()
+		return nil
+	}
+
+	if wait := time.Until(p.recoveringUntil); wait > 0 {
+		if inputName, ok := p.localNestDerivedInput(); ok {
+			if status, ok := localNestSourceAvailableForDerived(inputName); ok {
+				if p.recentExecNestFailuresLocked(time.Now()) > 0 {
 					log.Warn().
 						Str("url", safeProducerURL(p.url)).
 						Str("derived_input", inputName).
@@ -130,50 +137,81 @@ func (p *Producer) Dial() error {
 						Int("raw_medias", status.Medias).
 						Int("raw_receivers", status.Receivers).
 						Int("raw_packets", status.Packets).
-						Msg("[streams] clear producer dial recovery because raw nest media is present")
-				} else {
-					log.Warn().
-						Str("url", safeProducerURL(p.url)).
-						Stringer("wait", wait.Round(time.Millisecond)).
-						Msg("[streams] skip producer dial during local nest recovery")
+						Int("failures", p.execNestFailures).
+						Msg("[streams] keep producer dial recovery during derived publish backoff")
+					p.mu.Unlock()
 					return errors.New(execNestResetError)
 				}
+				p.recoveringUntil = time.Time{}
+				log.Warn().
+					Str("url", safeProducerURL(p.url)).
+					Str("derived_input", inputName).
+					Stringer("wait", wait.Round(time.Millisecond)).
+					Int("raw_medias", status.Medias).
+					Int("raw_receivers", status.Receivers).
+					Int("raw_packets", status.Packets).
+					Msg("[streams] clear producer dial recovery because raw nest media is present")
 			} else {
 				log.Warn().
 					Str("url", safeProducerURL(p.url)).
 					Stringer("wait", wait.Round(time.Millisecond)).
 					Msg("[streams] skip producer dial during local nest recovery")
+				p.mu.Unlock()
 				return errors.New(execNestResetError)
 			}
-		}
-
-		if wait := time.Until(p.recoveringUntil); wait > 0 {
+		} else {
 			log.Warn().
 				Str("url", safeProducerURL(p.url)).
 				Stringer("wait", wait.Round(time.Millisecond)).
 				Msg("[streams] skip producer dial during local nest recovery")
+			p.mu.Unlock()
 			return errors.New(execNestResetError)
 		}
+	}
 
-		conn, err := GetProducer(p.url)
-		if err != nil {
-			if strings.Contains(err.Error(), execNestResetError) {
-				wait := p.markExecNestBackoffLocked()
-				log.Warn().
-					Str("url", safeProducerURL(p.url)).
-					Int("failures", p.execNestFailures).
-					Stringer("wait", wait.Round(time.Millisecond)).
-					Msg("[streams] local nest derived producer backoff")
-			}
+	if wait := time.Until(p.recoveringUntil); wait > 0 {
+		log.Warn().
+			Str("url", safeProducerURL(p.url)).
+			Stringer("wait", wait.Round(time.Millisecond)).
+			Msg("[streams] skip producer dial during local nest recovery")
+		p.mu.Unlock()
+		return errors.New(execNestResetError)
+	}
+
+	conn, err := GetProducer(p.url)
+	if err != nil {
+		if strings.Contains(err.Error(), execNestResetError) {
+			wait := p.markExecNestBackoffLocked()
+			log.Warn().
+				Str("url", safeProducerURL(p.url)).
+				Int("failures", p.execNestFailures).
+				Stringer("wait", wait.Round(time.Millisecond)).
+				Msg("[streams] local nest derived producer backoff")
+		}
+		p.mu.Unlock()
+		return err
+	}
+
+	p.conn = conn
+	p.state = stateMedias
+	_, localNestDerived := p.localNestDerivedInput()
+	if !localNestDerived {
+		p.recoveringUntil = time.Time{}
+		p.clearExecNestBackoffLocked()
+	}
+	p.mu.Unlock()
+
+	if localNestDerived {
+		if err := p.waitLocalNestDerivedWarmup(); err != nil {
+			p.mu.Lock()
+			p.stopLocked()
+			p.mu.Unlock()
 			return err
 		}
-
-		p.conn = conn
-		p.state = stateMedias
+		p.mu.Lock()
 		p.recoveringUntil = time.Time{}
-		if _, ok := p.localNestDerivedInput(); !ok {
-			p.clearExecNestBackoffLocked()
-		}
+		p.clearExecNestBackoffLocked()
+		p.mu.Unlock()
 	}
 
 	return nil
@@ -277,7 +315,12 @@ func (p *Producer) sourceSchemeStatus(scheme string) SourceSchemeStatus {
 		}
 	}
 
-	for _, receiver := range p.receivers {
+	receivers := p.receivers
+	if stats, ok := p.conn.(sourceReceiverStats); ok {
+		receivers = stats.SourceReceivers()
+	}
+
+	for _, receiver := range receivers {
 		if receiver == nil || receiver.Codec == nil || core.GetKind(receiver.Codec.Name) != core.KindVideo {
 			continue
 		}
@@ -319,8 +362,8 @@ func (p *Producer) waitLocalNestDerivedWarmup() error {
 				Int("raw_receivers", status.Receivers).
 				Int("raw_packets", status.Packets).
 				Bool("recovery_owner", false).
-				Msg("[streams] allow local nest derived recovery waiter because raw media is present")
-			return nil
+				Msg("[streams] local nest derived recovery waiter still has no derived media")
+			return errors.New(execNestResetError)
 		}
 		log.Warn().
 			Str("url", safeProducerURL(p.url)).
@@ -340,7 +383,21 @@ func (p *Producer) waitLocalNestDerivedWarmupOwner(inputName string) error {
 	now := time.Now()
 	p.mu.Lock()
 	if wait := p.recoveringUntil.Sub(now); wait > 0 {
+		failures := p.recentExecNestFailuresLocked(now)
 		if status, ok := localNestSourceAvailableForDerived(inputName); ok {
+			if failures > 0 {
+				p.mu.Unlock()
+				log.Warn().
+					Str("url", safeProducerURL(p.url)).
+					Str("derived_input", inputName).
+					Stringer("wait", wait.Round(time.Millisecond)).
+					Int("raw_medias", status.Medias).
+					Int("raw_receivers", status.Receivers).
+					Int("raw_packets", status.Packets).
+					Int("failures", failures).
+					Msg("[streams] keep local nest derived recovery hold during publish backoff")
+				return errors.New(execNestResetError)
+			}
 			p.recoveringUntil = time.Time{}
 			p.mu.Unlock()
 			log.Warn().
@@ -438,26 +495,7 @@ func (p *Producer) waitLocalNestDerivedWarmupOwner(inputName string) error {
 
 		select {
 		case <-deadline.C:
-			if status, ok := localNestSourceAvailableForDerived(inputName); ok {
-				p.mu.Lock()
-				p.clearExecNestBackoffLocked()
-				p.recoveringUntil = time.Time{}
-				p.mu.Unlock()
-				log.Warn().
-					Str("url", safeProducerURL(p.url)).
-					Str("derived_input", inputName).
-					Int("video_medias", medias).
-					Int("packets_start", startPackets).
-					Int("packets_now", packets).
-					Int("packet_delta", packets-startPackets).
-					Int("raw_medias", status.Medias).
-					Int("raw_receivers", status.Receivers).
-					Int("raw_packets", status.Packets).
-					Bool("recovery_owner", true).
-					Msg("[streams] allow local nest derived media timeout because raw media is present")
-				return nil
-			}
-
+			rawStatus, rawOK := localNestSourceAvailableForDerived(inputName)
 			p.mu.Lock()
 			wait := p.markExecNestBackoffLocked()
 			failures := p.execNestFailures
@@ -468,7 +506,8 @@ func (p *Producer) waitLocalNestDerivedWarmupOwner(inputName string) error {
 			if resetRaw {
 				handled, changed, inactive = ResetIfSourceSchemeDetailed(inputName, "nest", "derived media timeout")
 			}
-			log.Warn().
+
+			ev := log.Warn().
 				Str("url", safeProducerURL(p.url)).
 				Str("derived_input", inputName).
 				Int("video_medias", medias).
@@ -477,12 +516,19 @@ func (p *Producer) waitLocalNestDerivedWarmupOwner(inputName string) error {
 				Int("packet_delta", packets-startPackets).
 				Stringer("backoff", wait.Round(time.Millisecond)).
 				Int("failures", failures).
+				Bool("raw_available", rawOK).
 				Bool("reset_raw", resetRaw).
 				Bool("raw_handled", handled).
 				Bool("raw_changed", changed).
 				Bool("raw_inactive", inactive).
-				Bool("recovery_owner", true).
-				Msg("[streams] local nest derived media timeout")
+				Bool("recovery_owner", true)
+			if rawOK {
+				ev.
+					Int("raw_medias", rawStatus.Medias).
+					Int("raw_receivers", rawStatus.Receivers).
+					Int("raw_packets", rawStatus.Packets)
+			}
+			ev.Msg("[streams] local nest derived media timeout")
 			return errors.New(execNestResetError)
 		case <-ticker.C:
 		}
@@ -535,30 +581,14 @@ func (p *Producer) waitLocalNestDerivedSettle(inputName string, settleFor time.D
 }
 
 func (p *Producer) failLocalNestDerivedSettle(inputName string, startPackets, packets int, reason string) error {
-	if status, ok := localNestSourceAvailableForDerived(inputName); ok {
-		p.mu.Lock()
-		p.clearExecNestBackoffLocked()
-		p.recoveringUntil = time.Time{}
-		p.mu.Unlock()
-		log.Warn().
-			Str("url", safeProducerURL(p.url)).
-			Str("derived_input", inputName).
-			Str("reason", reason).
-			Int("packets_start", startPackets).
-			Int("packets_now", packets).
-			Int("raw_medias", status.Medias).
-			Int("raw_receivers", status.Receivers).
-			Int("raw_packets", status.Packets).
-			Msg("[streams] allow local nest derived settle failure because raw media is present")
-		return nil
-	}
+	rawStatus, rawOK := localNestSourceAvailableForDerived(inputName)
 
 	p.mu.Lock()
 	wait := p.markExecNestBackoffLocked()
 	failures := p.execNestFailures
 	p.mu.Unlock()
 
-	log.Warn().
+	ev := log.Warn().
 		Str("url", safeProducerURL(p.url)).
 		Str("derived_input", inputName).
 		Str("reason", reason).
@@ -566,7 +596,14 @@ func (p *Producer) failLocalNestDerivedSettle(inputName string, startPackets, pa
 		Int("packets_now", packets).
 		Stringer("backoff", wait.Round(time.Millisecond)).
 		Int("failures", failures).
-		Msg("[streams] local nest derived media settle failed")
+		Bool("raw_available", rawOK)
+	if rawOK {
+		ev.
+			Int("raw_medias", rawStatus.Medias).
+			Int("raw_receivers", rawStatus.Receivers).
+			Int("raw_packets", rawStatus.Packets)
+	}
+	ev.Msg("[streams] local nest derived media settle failed")
 	return errors.New(execNestResetError)
 }
 
@@ -674,7 +711,7 @@ func execNestShouldResetRawAfterDerivedFailure(failures int) bool {
 }
 
 func sourceSchemeHasMedia(status SourceSchemeStatus) bool {
-	return status.Handled && status.Medias > 0
+	return status.Handled && status.Medias > 0 && status.Receivers > 0 && status.Packets > 0
 }
 
 func localNestSourceAvailableForDerived(name string) (SourceSchemeStatus, bool) {

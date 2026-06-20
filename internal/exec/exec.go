@@ -90,12 +90,14 @@ var errLocalNestUpstreamReset = errors.New("exec: local nest upstream reset")
 var errLocalNestMediaTimeout = errors.New("exec: local nest upstream media timeout")
 
 type localNestRecoveryState struct {
-	until         time.Time
-	failures      int
-	probeFailures int
-	lastFailure   time.Time
-	publishID     uint64
-	packets       int
+	until              time.Time
+	failures           int
+	probeFailures      int
+	lastFailure        time.Time
+	publishID          uint64
+	publishTimeouts    int
+	lastPublishTimeout time.Time
+	packets            int
 }
 
 var localNestRecovery = struct {
@@ -264,6 +266,7 @@ func handleRTSP(source string, cmd *shell.Command, path string, timeout time.Dur
 	case <-timer.C:
 		// haven't received data from app in timeout
 		log.Error().Str("source", safeExecLogSource(source)).Msg("[exec] timeout")
+		_ = cmd.Close()
 		if resetLocalNestInput(cmd.Args, "exec start timeout") {
 			return nil, errLocalNestUpstreamReset
 		}
@@ -304,6 +307,39 @@ func resetLocalNestInput(args []string, reason string) bool {
 	}
 
 	if status, ok := localNestSourceAvailable(name); ok {
+		if reason == "exec start timeout" {
+			reset, attempts := markLocalNestPublishTimeout(name, status)
+			if reset {
+				handled, changed, inactive := streams.ResetIfSourceSchemeDetailed(name, "nest", "exec publish timeout with stale raw media")
+				ev := log.Warn().
+					Str("reason", reason).
+					Int("medias", status.Medias).
+					Int("receivers", status.Receivers).
+					Int("packets", status.Packets).
+					Int("publish_timeouts", attempts).
+					Bool("raw_handled", handled).
+					Bool("raw_changed", changed).
+					Bool("raw_inactive", inactive)
+				if changed {
+					wait := markLocalNestRecovery(name, "exec publish timeout with stale raw media", inactive)
+					ev.Stringer("wait", wait.Round(time.Millisecond)).
+						Msg("[exec] reset upstream nest stream after derived publish timeouts")
+				} else {
+					ev.Msg("[exec] upstream nest reset requested after derived publish timeouts")
+				}
+				return handled
+			}
+
+			log.Warn().
+				Str("reason", reason).
+				Int("medias", status.Medias).
+				Int("receivers", status.Receivers).
+				Int("packets", status.Packets).
+				Int("publish_timeouts", attempts).
+				Msg("[exec] keep upstream nest stream after first derived publish timeout")
+			return false
+		}
+
 		clearLocalNestRecovery(name)
 		log.Warn().
 			Str("reason", reason).
@@ -342,27 +378,33 @@ func resetLocalNestInput(args []string, reason string) bool {
 }
 
 func localNestInputName(args []string) (string, bool) {
+	name, _, ok := localNestInput(args)
+	return name, ok
+}
+
+func localNestInput(args []string) (string, string, bool) {
 	i := core.Index(args, "-i")
 	if i <= 0 || i >= len(args)-1 {
-		return "", false
+		return "", "", false
 	}
 
-	u, err := url.Parse(args[i+1])
+	rawURL := args[i+1]
+	u, err := url.Parse(rawURL)
 	if err != nil || u.Scheme != "rtsp" || u.Path == "" {
-		return "", false
+		return "", "", false
 	}
 
 	host := u.Hostname()
 	if host != "127.0.0.1" && host != "localhost" && host != "::1" {
-		return "", false
+		return "", "", false
 	}
 
 	name := strings.TrimPrefix(u.Path, "/")
 	if name == "" {
-		return "", false
+		return "", "", false
 	}
 
-	return name, true
+	return name, rawURL, true
 }
 
 func markLocalNestRecovery(name string, reason string, inactive bool) time.Duration {
@@ -440,6 +482,30 @@ func localNestRecoveryWait(name string) time.Duration {
 		return wait
 	}
 	return 0
+}
+
+func markLocalNestPublishTimeout(name string, status streams.SourceSchemeStatus) (bool, int) {
+	now := time.Now()
+
+	localNestRecovery.Lock()
+	st := localNestRecovery.state[name]
+	if st.lastPublishTimeout.IsZero() || now.Sub(st.lastPublishTimeout) > localNestRecoveryRepeatWindow {
+		st.publishTimeouts = 0
+	}
+	st.publishTimeouts++
+	st.lastPublishTimeout = now
+	st.lastFailure = now
+
+	attempts := st.publishTimeouts
+	// If the derived ffmpeg publisher cannot ANNOUNCE within the start timeout,
+	// the raw Nest session is not usable for Frigate even when packet counters
+	// are moving. Reset it instead of preserving a stale-but-chatty media path.
+	reset := true
+	st.until = now.Add(localNestRecoveryWindowBase)
+	localNestRecovery.state[name] = st
+	localNestRecovery.Unlock()
+
+	return reset, attempts
 }
 
 func waitLocalNestMediaReady(name string, cmd *shell.Command) error {
@@ -527,7 +593,7 @@ func localNestMediaReadyForRecovery(status streams.SourceSchemeStatus, startPack
 }
 
 func localNestStatusAvailable(status streams.SourceSchemeStatus) bool {
-	return status.Handled && status.Medias > 0
+	return status.Handled && status.Medias > 0 && status.Receivers > 0 && status.Packets > 0
 }
 
 func localNestSourceAvailable(name string) (streams.SourceSchemeStatus, bool) {
@@ -545,6 +611,14 @@ func waitLocalNestRecovery(name string) error {
 	wait := localNestRecoveryWait(name)
 	if wait <= 0 {
 		return nil
+	}
+
+	if publishWait, attempts := localNestPublishRecoveryWait(name); publishWait > 0 {
+		log.Warn().
+			Stringer("wait", publishWait.Round(time.Millisecond)).
+			Int("publish_timeouts", attempts).
+			Msg("[exec] keep local nest recovery for derived publish backoff")
+		return errLocalNestUpstreamReset
 	}
 
 	if status, ok := localNestSourceAvailable(name); ok {
@@ -579,6 +653,21 @@ func waitLocalNestRecovery(name string) error {
 	}
 	log.Info().Msg("[exec] local nest recovery wait complete")
 	return nil
+}
+
+func localNestPublishRecoveryWait(name string) (time.Duration, int) {
+	localNestRecovery.Lock()
+	st, ok := localNestRecovery.state[name]
+	localNestRecovery.Unlock()
+
+	if !ok || st.publishTimeouts <= 0 {
+		return 0, 0
+	}
+	wait := time.Until(st.until)
+	if wait <= 0 {
+		return 0, st.publishTimeouts
+	}
+	return wait, st.publishTimeouts
 }
 
 func markLocalNestPublished(name string, reason string) {

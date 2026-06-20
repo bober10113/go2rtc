@@ -4,6 +4,8 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/AlexxIT/go2rtc/pkg/core"
 )
 
 func TestExecNestDerivedWarmupPolicyEscalatesAfterRecentFailures(t *testing.T) {
@@ -60,8 +62,48 @@ func TestSourceSchemeHasMedia(t *testing.T) {
 		t.Fatalf("handled status without media has media")
 	}
 
-	if !sourceSchemeHasMedia(SourceSchemeStatus{Handled: true, Medias: 1}) {
-		t.Fatalf("handled status with media was not detected")
+	if sourceSchemeHasMedia(SourceSchemeStatus{Handled: true, Medias: 1}) {
+		t.Fatalf("handled status without receiver/packets has media")
+	}
+
+	if sourceSchemeHasMedia(SourceSchemeStatus{Handled: true, Medias: 1, Receivers: 1}) {
+		t.Fatalf("handled status without packets has media")
+	}
+
+	if !sourceSchemeHasMedia(SourceSchemeStatus{Handled: true, Medias: 1, Receivers: 1, Packets: 1}) {
+		t.Fatalf("handled status with packet flow was not detected")
+	}
+}
+
+func TestSourceSchemeStatusUsesSourceReceiverStats(t *testing.T) {
+	codec := &core.Codec{Name: core.CodecH264}
+	media := &core.Media{
+		Kind:      core.KindVideo,
+		Direction: core.DirectionRecvonly,
+		Codecs:    []*core.Codec{codec},
+	}
+	localReceiver := core.NewReceiver(media, codec)
+	sourceReceiver := core.NewReceiver(media, codec)
+	sourceReceiver.Packets = 42
+
+	prod := &Producer{
+		url:       "nest:?device_id=redacted",
+		conn:      &sourceStatsProducer{medias: []*core.Media{media}, receivers: []*core.Receiver{sourceReceiver}},
+		receivers: []*core.Receiver{localReceiver},
+	}
+
+	status := prod.sourceSchemeStatus("nest")
+	if !status.Handled {
+		t.Fatalf("nest source was not handled")
+	}
+	if status.Medias != 1 {
+		t.Fatalf("medias = %d, want 1", status.Medias)
+	}
+	if status.Receivers != 1 {
+		t.Fatalf("receivers = %d, want 1", status.Receivers)
+	}
+	if status.Packets != 42 {
+		t.Fatalf("packets = %d, want source receiver packets", status.Packets)
 	}
 }
 
@@ -163,4 +205,29 @@ func resetExecNestDerivedRecoveryForTest() {
 	execNestDerivedRecovery.Lock()
 	defer execNestDerivedRecovery.Unlock()
 	execNestDerivedRecovery.calls = map[string]*execNestDerivedRecoveryCall{}
+}
+
+type sourceStatsProducer struct {
+	medias    []*core.Media
+	receivers []*core.Receiver
+}
+
+func (p *sourceStatsProducer) GetMedias() []*core.Media {
+	return p.medias
+}
+
+func (p *sourceStatsProducer) GetTrack(_ *core.Media, _ *core.Codec) (*core.Receiver, error) {
+	return nil, core.ErrCantGetTrack
+}
+
+func (p *sourceStatsProducer) SourceReceivers() []*core.Receiver {
+	return p.receivers
+}
+
+func (p *sourceStatsProducer) Start() error {
+	return nil
+}
+
+func (p *sourceStatsProducer) Stop() error {
+	return nil
 }

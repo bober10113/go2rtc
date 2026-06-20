@@ -39,7 +39,65 @@ func TestLocalNestStatusAvailableUsesMediaPresence(t *testing.T) {
 		t.Fatalf("handled status without media was available")
 	}
 
-	if !localNestStatusAvailable(streams.SourceSchemeStatus{Handled: true, Medias: 1}) {
-		t.Fatalf("handled status with media was not available")
+	if localNestStatusAvailable(streams.SourceSchemeStatus{Handled: true, Medias: 1}) {
+		t.Fatalf("handled status without receiver/packets was available")
+	}
+
+	if localNestStatusAvailable(streams.SourceSchemeStatus{Handled: true, Medias: 1, Receivers: 1}) {
+		t.Fatalf("handled status without packets was available")
+	}
+
+	if !localNestStatusAvailable(streams.SourceSchemeStatus{Handled: true, Medias: 1, Receivers: 1, Packets: 1}) {
+		t.Fatalf("handled status with packet flow was not available")
+	}
+}
+
+func TestLocalNestPublishTimeoutResetsWhenRawPacketsAreMissing(t *testing.T) {
+	localNestRecovery.Lock()
+	localNestRecovery.state = map[string]localNestRecoveryState{}
+	localNestRecovery.Unlock()
+
+	reset, attempts := markLocalNestPublishTimeout("cam_raw", streams.SourceSchemeStatus{
+		Handled:   true,
+		Medias:    1,
+		Receivers: 1,
+	})
+	if !reset {
+		t.Fatalf("publish timeout with zero raw packets did not reset")
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want 1", attempts)
+	}
+}
+
+func TestLocalNestPublishTimeoutResetsWhenRawPacketsContinue(t *testing.T) {
+	localNestRecovery.Lock()
+	localNestRecovery.state = map[string]localNestRecoveryState{}
+	localNestRecovery.Unlock()
+
+	status := streams.SourceSchemeStatus{
+		Handled:   true,
+		Medias:    1,
+		Receivers: 1,
+		Packets:   10,
+	}
+
+	reset, attempts := markLocalNestPublishTimeout("cam_raw", status)
+	if !reset {
+		t.Fatalf("first publish timeout with raw packets did not reset")
+	}
+	if attempts != 1 {
+		t.Fatalf("first attempts = %d, want 1", attempts)
+	}
+	if wait, attempts := localNestPublishRecoveryWait("cam_raw"); wait <= 0 || attempts != 1 {
+		t.Fatalf("publish recovery wait = %s attempts = %d, want active wait with one attempt", wait, attempts)
+	}
+
+	reset, attempts = markLocalNestPublishTimeout("cam_raw", status)
+	if !reset {
+		t.Fatalf("second publish timeout with raw packets did not reset")
+	}
+	if attempts != 2 {
+		t.Fatalf("second attempts = %d, want 2", attempts)
 	}
 }
