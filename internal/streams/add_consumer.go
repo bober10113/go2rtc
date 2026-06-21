@@ -14,6 +14,7 @@ func (s *Stream) AddConsumer(cons core.Consumer) (err error) {
 	var prodErrors = make([]error, len(s.producers))
 	var prodMedias []*core.Media
 	var prodStarts []*Producer
+	var prodPrepared = make(map[*Producer]error)
 
 	// Step 1. Get consumer medias
 	consMedias := cons.GetMedias()
@@ -62,6 +63,24 @@ func (s *Stream) AddConsumer(cons core.Consumer) (err error) {
 						prodErrors[prodN] = err
 						continue
 					}
+
+					if _, ok := prod.localNestDerivedInput(); ok && core.GetKind(prodCodec.Name) == core.KindVideo {
+						if err, checked := prodPrepared[prod]; checked {
+							if err != nil {
+								prodErrors[prodN] = err
+								continue
+							}
+						} else {
+							prod.start()
+							err = prod.waitLocalNestDerivedWarmup()
+							prodPrepared[prod] = err
+							if err != nil {
+								prodErrors[prodN] = err
+								continue
+							}
+						}
+					}
+
 					// Step 5. Add track to consumer
 					if err = cons.AddTrack(consMedia, consCodec, track); err != nil {
 						log.Info().Err(err).Msg("[streams] can't add track")

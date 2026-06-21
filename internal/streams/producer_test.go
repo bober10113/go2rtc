@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/core"
+	"github.com/AlexxIT/go2rtc/pkg/h264"
 )
 
 func TestExecNestDerivedWarmupPolicyEscalatesAfterRecentFailures(t *testing.T) {
@@ -70,8 +71,12 @@ func TestSourceSchemeHasMedia(t *testing.T) {
 		t.Fatalf("handled status without packets has media")
 	}
 
-	if !sourceSchemeHasMedia(SourceSchemeStatus{Handled: true, Medias: 1, Receivers: 1, Packets: 1}) {
-		t.Fatalf("handled status with packet flow was not detected")
+	if sourceSchemeHasMedia(SourceSchemeStatus{Handled: true, Medias: 1, Receivers: 1, Packets: 1}) {
+		t.Fatalf("handled status without byte flow has media")
+	}
+
+	if !sourceSchemeHasMedia(SourceSchemeStatus{Handled: true, Medias: 1, Receivers: 1, Packets: 1, Bytes: 64}) {
+		t.Fatalf("handled status with media flow was not detected")
 	}
 }
 
@@ -85,6 +90,7 @@ func TestSourceSchemeStatusUsesSourceReceiverStats(t *testing.T) {
 	localReceiver := core.NewReceiver(media, codec)
 	sourceReceiver := core.NewReceiver(media, codec)
 	sourceReceiver.Packets = 42
+	sourceReceiver.Bytes = 1024
 
 	prod := &Producer{
 		url:       "nest:?device_id=redacted",
@@ -104,6 +110,69 @@ func TestSourceSchemeStatusUsesSourceReceiverStats(t *testing.T) {
 	}
 	if status.Packets != 42 {
 		t.Fatalf("packets = %d, want source receiver packets", status.Packets)
+	}
+	if status.Bytes != 1024 {
+		t.Fatalf("bytes = %d, want source receiver bytes", status.Bytes)
+	}
+}
+
+func TestSourceSchemeStatusForStreamAggregatesBytes(t *testing.T) {
+	const streamName = "test_nest_raw_bytes"
+	defer Delete(streamName)
+
+	codec := &core.Codec{Name: core.CodecH264}
+	media := &core.Media{
+		Kind:      core.KindVideo,
+		Direction: core.DirectionRecvonly,
+		Codecs:    []*core.Codec{codec},
+	}
+	sourceReceiver := core.NewReceiver(media, codec)
+	sourceReceiver.Packets = 7
+	sourceReceiver.Bytes = 4096
+
+	stream := &Stream{
+		producers: []*Producer{{
+			url:       "nest:?device_id=redacted",
+			conn:      &sourceStatsProducer{medias: []*core.Media{media}, receivers: []*core.Receiver{sourceReceiver}},
+			receivers: []*core.Receiver{core.NewReceiver(media, codec)},
+		}},
+	}
+
+	streamsMu.Lock()
+	streams[streamName] = stream
+	streamsMu.Unlock()
+
+	status := SourceSchemeStatusForStream(streamName, "nest")
+	if status.Packets != 7 {
+		t.Fatalf("packets = %d, want 7", status.Packets)
+	}
+	if status.Bytes != 4096 {
+		t.Fatalf("bytes = %d, want 4096", status.Bytes)
+	}
+	if _, ok := localNestSourceAvailableForDerived(streamName); !ok {
+		t.Fatalf("raw nest stream with packet and byte flow was not available")
+	}
+}
+
+func TestLocalNestH264ReadinessFromRTP(t *testing.T) {
+	prod := &Producer{}
+
+	prod.observeLocalNestH264Payload([]byte{h264.NALUTypeSPS})
+	prod.observeLocalNestH264Payload([]byte{h264.NALUTypePPS})
+	prod.observeLocalNestH264Payload([]byte{h264.NALUTypeIFrame})
+
+	if !prod.localNestH264SPS.Load() || !prod.localNestH264PPS.Load() || !prod.localNestH264Keyframe.Load() {
+		t.Fatalf("H264 readiness was not detected from single NALU RTP payloads")
+	}
+}
+
+func TestLocalNestH264ReadinessFromFragmentedIDR(t *testing.T) {
+	prod := &Producer{}
+
+	prod.observeLocalNestH264Payload([]byte{28, 0x80 | h264.NALUTypeIFrame})
+
+	if !prod.localNestH264Keyframe.Load() {
+		t.Fatalf("H264 keyframe was not detected from FU-A start packet")
 	}
 }
 

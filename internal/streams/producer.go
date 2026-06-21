@@ -1,14 +1,17 @@
 package streams
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/core"
+	"github.com/AlexxIT/go2rtc/pkg/h264"
 	"github.com/AlexxIT/go2rtc/pkg/shell"
 )
 
@@ -43,6 +46,11 @@ type Producer struct {
 	execNestLastStart time.Time
 	recoveringUntil   time.Time
 	idleRecoverUntil  time.Time
+
+	localNestH264SPS         atomic.Bool
+	localNestH264PPS         atomic.Bool
+	localNestH264Keyframe    atomic.Bool
+	localNestVideoPacketNsec atomic.Int64
 }
 
 const SourceTemplate = "{input}"
@@ -75,6 +83,8 @@ const (
 	execNestDerivedFlapSettle       = 5 * time.Second
 	execNestDerivedHardSettle       = 10 * time.Second
 	execNestDerivedRawResetAfter    = 3
+	execNestDerivedStaleCheck       = 5 * time.Second
+	execNestDerivedStaleAfter       = 10 * time.Second
 )
 
 type SourceSchemeStatus struct {
@@ -82,6 +92,15 @@ type SourceSchemeStatus struct {
 	Medias    int
 	Receivers int
 	Packets   int
+	Bytes     int
+}
+
+type videoMediaStatus struct {
+	Medias       int
+	Packets      int
+	Bytes        int
+	H264Required bool
+	H264Ready    bool
 }
 
 type sourceReceiverStats interface {
@@ -195,13 +214,16 @@ func (p *Producer) Dial() error {
 	p.conn = conn
 	p.state = stateMedias
 	_, localNestDerived := p.localNestDerivedInput()
+	hasVideoReceivers := p.hasVideoReceiversLocked()
 	if !localNestDerived {
 		p.recoveringUntil = time.Time{}
 		p.clearExecNestBackoffLocked()
+	} else {
+		p.resetLocalNestReadiness()
 	}
 	p.mu.Unlock()
 
-	if localNestDerived {
+	if localNestDerived && hasVideoReceivers {
 		if err := p.waitLocalNestDerivedWarmup(); err != nil {
 			p.mu.Lock()
 			p.stopLocked()
@@ -247,6 +269,10 @@ func (p *Producer) GetTrack(media *core.Media, codec *core.Codec) (*core.Receive
 	track, err := p.conn.GetTrack(media, codec)
 	if err != nil {
 		return nil, err
+	}
+
+	if _, ok := p.localNestDerivedInput(); ok && codec != nil && codec.Name == core.CodecH264 {
+		p.armLocalNestH264Readiness(codec, track)
 	}
 
 	p.receivers = append(p.receivers, track)
@@ -326,6 +352,7 @@ func (p *Producer) sourceSchemeStatus(scheme string) SourceSchemeStatus {
 		}
 		status.Receivers++
 		status.Packets += receiver.Packets
+		status.Bytes += receiver.Bytes
 	}
 
 	return status
@@ -350,7 +377,7 @@ func (p *Producer) waitLocalNestDerivedWarmup() error {
 		if call.err != nil {
 			return call.err
 		}
-		if medias, packets := p.videoPacketStatus(); medias > 0 && packets > 0 {
+		if status := p.videoMediaStatus(); status.Ready() {
 			return nil
 		}
 		if status, ok := localNestSourceAvailableForDerived(inputName); ok {
@@ -361,6 +388,7 @@ func (p *Producer) waitLocalNestDerivedWarmup() error {
 				Int("raw_medias", status.Medias).
 				Int("raw_receivers", status.Receivers).
 				Int("raw_packets", status.Packets).
+				Int("raw_bytes", status.Bytes).
 				Bool("recovery_owner", false).
 				Msg("[streams] local nest derived recovery waiter still has no derived media")
 			return errors.New(execNestResetError)
@@ -424,7 +452,8 @@ func (p *Producer) waitLocalNestDerivedWarmupOwner(inputName string) error {
 	failures := p.recentExecNestFailuresLocked(now)
 	p.mu.Unlock()
 
-	startMedias, startPackets := p.videoPacketStatus()
+	startStatus := p.videoMediaStatus()
+	startMedias, startPackets, startBytes := startStatus.Medias, startStatus.Packets, startStatus.Bytes
 	recentStarts := 0
 	if startPackets == 0 {
 		p.mu.Lock()
@@ -458,16 +487,20 @@ func (p *Producer) waitLocalNestDerivedWarmupOwner(inputName string) error {
 		Int("min_packets", minPackets).
 		Int("video_medias", startMedias).
 		Int("packets", startPackets).
+		Int("bytes", startBytes).
+		Bool("h264_required", startStatus.H264Required).
+		Bool("h264_ready", startStatus.H264Ready).
 		Bool("recovery_owner", true).
 		Msg("[streams] waiting for local nest derived media")
 
 	for {
-		medias, packets = p.videoPacketStatus()
-		if medias > 0 && packets >= startPackets+minPackets {
+		status := p.videoMediaStatus()
+		medias, packets = status.Medias, status.Packets
+		if status.Ready() && packets >= startPackets+minPackets && status.Bytes > startBytes {
 			if readySince.IsZero() {
 				readySince = time.Now()
 				readyPackets = packets
-			} else if time.Since(readySince) >= stableFor && packets > readyPackets {
+			} else if time.Since(readySince) >= stableFor && packets > readyPackets && status.Bytes > startBytes {
 				log.Info().
 					Str("url", safeProducerURL(p.url)).
 					Int("failures", failures).
@@ -475,10 +508,15 @@ func (p *Producer) waitLocalNestDerivedWarmupOwner(inputName string) error {
 					Int("packets_start", startPackets).
 					Int("packets_now", packets).
 					Int("packet_delta", packets-startPackets).
+					Int("bytes_start", startBytes).
+					Int("bytes_now", status.Bytes).
+					Int("byte_delta", status.Bytes-startBytes).
+					Bool("h264_required", status.H264Required).
+					Bool("h264_ready", status.H264Ready).
 					Stringer("stable_for", time.Since(readySince).Round(time.Millisecond)).
 					Bool("recovery_owner", true).
 					Msg("[streams] local nest derived media ready")
-				if err := p.waitLocalNestDerivedSettle(inputName, settleFor, packets); err != nil {
+				if err := p.waitLocalNestDerivedSettle(inputName, settleFor, packets, status.Bytes); err != nil {
 					return err
 				}
 				p.mu.Lock()
@@ -514,6 +552,11 @@ func (p *Producer) waitLocalNestDerivedWarmupOwner(inputName string) error {
 				Int("packets_start", startPackets).
 				Int("packets_now", packets).
 				Int("packet_delta", packets-startPackets).
+				Int("bytes_start", startBytes).
+				Int("bytes_now", status.Bytes).
+				Int("byte_delta", status.Bytes-startBytes).
+				Bool("h264_required", status.H264Required).
+				Bool("h264_ready", status.H264Ready).
 				Stringer("backoff", wait.Round(time.Millisecond)).
 				Int("failures", failures).
 				Bool("raw_available", rawOK).
@@ -526,7 +569,8 @@ func (p *Producer) waitLocalNestDerivedWarmupOwner(inputName string) error {
 				ev.
 					Int("raw_medias", rawStatus.Medias).
 					Int("raw_receivers", rawStatus.Receivers).
-					Int("raw_packets", rawStatus.Packets)
+					Int("raw_packets", rawStatus.Packets).
+					Int("raw_bytes", rawStatus.Bytes)
 			}
 			ev.Msg("[streams] local nest derived media timeout")
 			return errors.New(execNestResetError)
@@ -535,7 +579,7 @@ func (p *Producer) waitLocalNestDerivedWarmupOwner(inputName string) error {
 	}
 }
 
-func (p *Producer) waitLocalNestDerivedSettle(inputName string, settleFor time.Duration, startPackets int) error {
+func (p *Producer) waitLocalNestDerivedSettle(inputName string, settleFor time.Duration, startPackets, startBytes int) error {
 	if settleFor <= 0 {
 		return nil
 	}
@@ -546,41 +590,49 @@ func (p *Producer) waitLocalNestDerivedSettle(inputName string, settleFor time.D
 	defer ticker.Stop()
 
 	lastPackets := startPackets
+	lastBytes := startBytes
 	log.Warn().
 		Str("url", safeProducerURL(p.url)).
 		Str("derived_input", inputName).
 		Stringer("settle", settleFor).
 		Int("packets_start", startPackets).
+		Int("bytes_start", startBytes).
 		Msg("[streams] settling local nest derived media")
 
 	for {
 		select {
 		case <-deadline.C:
-			medias, packets := p.videoPacketStatus()
-			if medias > 0 && packets > startPackets {
+			status := p.videoMediaStatus()
+			if status.Ready() && status.Packets > startPackets && status.Bytes > startBytes {
 				log.Info().
 					Str("url", safeProducerURL(p.url)).
 					Str("derived_input", inputName).
-					Int("video_medias", medias).
+					Int("video_medias", status.Medias).
 					Int("packets_start", startPackets).
-					Int("packets_now", packets).
-					Int("packet_delta", packets-startPackets).
+					Int("packets_now", status.Packets).
+					Int("packet_delta", status.Packets-startPackets).
+					Int("bytes_start", startBytes).
+					Int("bytes_now", status.Bytes).
+					Int("byte_delta", status.Bytes-startBytes).
+					Bool("h264_required", status.H264Required).
+					Bool("h264_ready", status.H264Ready).
 					Stringer("settled_for", settleFor).
 					Msg("[streams] local nest derived media settled")
 				return nil
 			}
-			return p.failLocalNestDerivedSettle(inputName, startPackets, packets, "settle expired without packet growth")
+			return p.failLocalNestDerivedSettle(inputName, startPackets, startBytes, status, "settle expired without media growth")
 		case <-ticker.C:
-			medias, packets := p.videoPacketStatus()
-			if medias == 0 || packets <= lastPackets {
-				return p.failLocalNestDerivedSettle(inputName, startPackets, packets, "packets stopped during settle")
+			status := p.videoMediaStatus()
+			if !status.Ready() || status.Packets <= lastPackets || status.Bytes <= lastBytes {
+				return p.failLocalNestDerivedSettle(inputName, startPackets, startBytes, status, "media stopped during settle")
 			}
-			lastPackets = packets
+			lastPackets = status.Packets
+			lastBytes = status.Bytes
 		}
 	}
 }
 
-func (p *Producer) failLocalNestDerivedSettle(inputName string, startPackets, packets int, reason string) error {
+func (p *Producer) failLocalNestDerivedSettle(inputName string, startPackets, startBytes int, status videoMediaStatus, reason string) error {
 	rawStatus, rawOK := localNestSourceAvailableForDerived(inputName)
 
 	p.mu.Lock()
@@ -588,20 +640,37 @@ func (p *Producer) failLocalNestDerivedSettle(inputName string, startPackets, pa
 	failures := p.execNestFailures
 	p.mu.Unlock()
 
+	resetRaw := execNestShouldResetRawAfterDerivedFailure(failures)
+	handled, changed, inactive := false, false, false
+	if resetRaw {
+		handled, changed, inactive = ResetIfSourceSchemeDetailed(inputName, "nest", "derived media settle failed")
+	}
+
 	ev := log.Warn().
 		Str("url", safeProducerURL(p.url)).
 		Str("derived_input", inputName).
 		Str("reason", reason).
 		Int("packets_start", startPackets).
-		Int("packets_now", packets).
+		Int("packets_now", status.Packets).
+		Int("packet_delta", status.Packets-startPackets).
+		Int("bytes_start", startBytes).
+		Int("bytes_now", status.Bytes).
+		Int("byte_delta", status.Bytes-startBytes).
+		Bool("h264_required", status.H264Required).
+		Bool("h264_ready", status.H264Ready).
 		Stringer("backoff", wait.Round(time.Millisecond)).
 		Int("failures", failures).
-		Bool("raw_available", rawOK)
+		Bool("raw_available", rawOK).
+		Bool("reset_raw", resetRaw).
+		Bool("raw_handled", handled).
+		Bool("raw_changed", changed).
+		Bool("raw_inactive", inactive)
 	if rawOK {
 		ev.
 			Int("raw_medias", rawStatus.Medias).
 			Int("raw_receivers", rawStatus.Receivers).
-			Int("raw_packets", rawStatus.Packets)
+			Int("raw_packets", rawStatus.Packets).
+			Int("raw_bytes", rawStatus.Bytes)
 	}
 	ev.Msg("[streams] local nest derived media settle failed")
 	return errors.New(execNestResetError)
@@ -639,14 +708,24 @@ func finishExecNestDerivedRecovery(inputName string, call *execNestDerivedRecove
 	close(call.done)
 }
 
+func (s videoMediaStatus) Ready() bool {
+	return s.Medias > 0 && s.Packets > 0 && s.Bytes > 0 && (!s.H264Required || s.H264Ready)
+}
+
 func (p *Producer) videoPacketStatus() (medias, packets int) {
+	status := p.videoMediaStatus()
+	return status.Medias, status.Packets
+}
+
+func (p *Producer) videoMediaStatus() videoMediaStatus {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	status := videoMediaStatus{H264Ready: true}
 	if p.conn != nil {
 		for _, media := range p.conn.GetMedias() {
 			if media.Direction == core.DirectionRecvonly && media.Kind == core.KindVideo && len(media.Codecs) > 0 {
-				medias++
+				status.Medias++
 			}
 		}
 	}
@@ -655,10 +734,87 @@ func (p *Producer) videoPacketStatus() (medias, packets int) {
 		if receiver == nil || receiver.Codec == nil || core.GetKind(receiver.Codec.Name) != core.KindVideo {
 			continue
 		}
-		packets += receiver.Packets
+		status.Packets += receiver.Packets
+		status.Bytes += receiver.Bytes
+		if receiver.Codec.Name == core.CodecH264 {
+			status.H264Required = true
+		}
 	}
 
-	return medias, packets
+	if status.H264Required {
+		status.H264Ready = p.localNestH264SPS.Load() && p.localNestH264PPS.Load() && p.localNestH264Keyframe.Load()
+	}
+
+	return status
+}
+
+func (p *Producer) resetLocalNestReadiness() {
+	p.localNestH264SPS.Store(false)
+	p.localNestH264PPS.Store(false)
+	p.localNestH264Keyframe.Store(false)
+	p.localNestVideoPacketNsec.Store(0)
+}
+
+func (p *Producer) armLocalNestH264Readiness(codec *core.Codec, track *core.Receiver) {
+	if track == nil || track.Input == nil {
+		return
+	}
+
+	if sps, pps := h264.GetParameterSet(codec.FmtpLine); len(sps) > 0 && len(pps) > 0 {
+		p.localNestH264SPS.Store(true)
+		p.localNestH264PPS.Store(true)
+	}
+
+	next := track.Input
+	track.Input = func(packet *core.Packet) {
+		p.observeLocalNestH264RTP(packet)
+		next(packet)
+	}
+}
+
+func (p *Producer) observeLocalNestH264RTP(packet *core.Packet) {
+	if packet == nil {
+		return
+	}
+	p.localNestVideoPacketNsec.Store(time.Now().UnixNano())
+	p.observeLocalNestH264Payload(packet.Payload)
+}
+
+func (p *Producer) observeLocalNestH264Payload(payload []byte) {
+	if len(payload) == 0 {
+		return
+	}
+
+	switch payload[0] & 0x1F {
+	case h264.NALUTypeIFrame, h264.NALUTypeSPS, h264.NALUTypePPS:
+		p.observeLocalNestH264NALUType(payload[0] & 0x1F)
+	case 24: // STAP-A
+		for offset := 1; offset+2 <= len(payload); {
+			size := int(binary.BigEndian.Uint16(payload[offset:]))
+			offset += 2
+			if size <= 0 || offset+size > len(payload) {
+				return
+			}
+			p.observeLocalNestH264NALUType(payload[offset] & 0x1F)
+			offset += size
+		}
+	case 28: // FU-A
+		if len(payload) < 2 || payload[1]&0x80 == 0 {
+			return
+		}
+		p.observeLocalNestH264NALUType(payload[1] & 0x1F)
+	}
+}
+
+func (p *Producer) observeLocalNestH264NALUType(naluType byte) {
+	switch naluType {
+	case h264.NALUTypeIFrame:
+		p.localNestH264Keyframe.Store(true)
+	case h264.NALUTypeSPS:
+		p.localNestH264SPS.Store(true)
+	case h264.NALUTypePPS:
+		p.localNestH264PPS.Store(true)
+	}
 }
 
 func execNestDerivedWarmupPolicy(failures int) (timeout time.Duration, stable time.Duration, minPackets int) {
@@ -711,7 +867,7 @@ func execNestShouldResetRawAfterDerivedFailure(failures int) bool {
 }
 
 func sourceSchemeHasMedia(status SourceSchemeStatus) bool {
-	return status.Handled && status.Medias > 0 && status.Receivers > 0 && status.Packets > 0
+	return status.Handled && status.Medias > 0 && status.Receivers > 0 && status.Packets > 0 && status.Bytes > 0
 }
 
 func localNestSourceAvailableForDerived(name string) (SourceSchemeStatus, bool) {
@@ -920,6 +1076,7 @@ func SourceSchemeStatusForStream(name, scheme string) SourceSchemeStatus {
 		status.Medias += producerStatus.Medias
 		status.Receivers += producerStatus.Receivers
 		status.Packets += producerStatus.Packets
+		status.Bytes += producerStatus.Bytes
 	}
 
 	return status
@@ -939,8 +1096,13 @@ func (p *Producer) start() {
 
 	p.state = stateStart
 	p.workerID++
+	workerID := p.workerID
+	inputName, localNestDerived := p.localNestDerivedInput()
 
-	go p.worker(p.conn, p.workerID)
+	go p.worker(p.conn, workerID)
+	if localNestDerived {
+		go p.watchLocalNestDerivedStale(workerID, inputName)
+	}
 }
 
 func (p *Producer) worker(conn core.Producer, workerID int) {
@@ -957,6 +1119,94 @@ func (p *Producer) worker(conn core.Producer, workerID int) {
 	}
 
 	p.reconnect(workerID, 0)
+}
+
+func (p *Producer) watchLocalNestDerivedStale(workerID int, inputName string) {
+	ticker := time.NewTicker(execNestDerivedStaleCheck)
+	defer ticker.Stop()
+
+	var (
+		lastPackets   int
+		lastBytes     int
+		stagnantSince time.Time
+	)
+
+	for range ticker.C {
+		p.mu.Lock()
+		active := p.workerID == workerID && p.state == stateStart
+		hasReaders := p.hasReadersLocked()
+		p.mu.Unlock()
+		if !active {
+			return
+		}
+		if !hasReaders {
+			stagnantSince = time.Time{}
+			continue
+		}
+
+		status := p.videoMediaStatus()
+		if !status.Ready() {
+			if stagnantSince.IsZero() {
+				stagnantSince = time.Now()
+				continue
+			}
+			if time.Since(stagnantSince) < execNestDerivedStaleAfter {
+				continue
+			}
+			p.stopLocalNestDerivedStale(workerID, inputName, status, time.Since(stagnantSince))
+			return
+		}
+
+		if status.Packets > lastPackets || status.Bytes > lastBytes {
+			lastPackets = status.Packets
+			lastBytes = status.Bytes
+			stagnantSince = time.Time{}
+			continue
+		}
+
+		if lastPackets == 0 && lastBytes == 0 {
+			lastPackets = status.Packets
+			lastBytes = status.Bytes
+			continue
+		}
+
+		if stagnantSince.IsZero() {
+			stagnantSince = time.Now()
+			continue
+		}
+		if time.Since(stagnantSince) < execNestDerivedStaleAfter {
+			continue
+		}
+
+		p.stopLocalNestDerivedStale(workerID, inputName, status, time.Since(stagnantSince))
+		return
+	}
+}
+
+func (p *Producer) stopLocalNestDerivedStale(workerID int, inputName string, status videoMediaStatus, stagnantFor time.Duration) {
+	p.mu.Lock()
+	if p.workerID != workerID || p.state != stateStart {
+		p.mu.Unlock()
+		return
+	}
+	wait := p.markExecNestBackoffLocked()
+	failures := p.execNestFailures
+	p.stopLocked()
+	p.recoveringUntil = time.Now().Add(wait)
+	p.mu.Unlock()
+
+	log.Warn().
+		Str("url", safeProducerURL(p.url)).
+		Str("derived_input", inputName).
+		Int("video_medias", status.Medias).
+		Int("packets", status.Packets).
+		Int("bytes", status.Bytes).
+		Bool("h264_required", status.H264Required).
+		Bool("h264_ready", status.H264Ready).
+		Int("failures", failures).
+		Stringer("stagnant_for", stagnantFor.Round(time.Millisecond)).
+		Stringer("backoff", wait.Round(time.Millisecond)).
+		Msg("[streams] local nest derived media stalled")
 }
 
 func (p *Producer) reconnect(workerID, retry int) {
@@ -982,6 +1232,10 @@ func (p *Producer) reconnect(workerID, retry int) {
 		return
 	}
 
+	_, localNestDerived := p.localNestDerivedInput()
+	if localNestDerived {
+		p.resetLocalNestReadiness()
+	}
 	p.recoveringUntil = time.Time{}
 
 	for _, media := range conn.GetMedias() {
@@ -998,6 +1252,9 @@ func (p *Producer) reconnect(workerID, retry int) {
 					continue
 				}
 
+				if localNestDerived && codec.Name == core.CodecH264 {
+					p.armLocalNestH264Readiness(codec, track)
+				}
 				receiver.Replace(track)
 				p.receivers[i] = track
 				break
@@ -1117,6 +1374,15 @@ func (p *Producer) hasReadersLocked() bool {
 	}
 	for _, track := range p.senders {
 		if len(track.Senders()) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *Producer) hasVideoReceiversLocked() bool {
+	for _, receiver := range p.receivers {
+		if receiver != nil && receiver.Codec != nil && core.GetKind(receiver.Codec.Name) == core.KindVideo {
 			return true
 		}
 	}
