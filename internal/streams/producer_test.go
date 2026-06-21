@@ -54,6 +54,26 @@ func TestExecNestShouldResetRawAfterDerivedFailure(t *testing.T) {
 	}
 }
 
+func TestExecNestShouldResetRawAfterDerivedSettleFailure(t *testing.T) {
+	if execNestShouldResetRawAfterDerivedSettleFailure(execNestDerivedSettleResetAfter - 1) {
+		t.Fatalf("settle raw reset triggered before threshold")
+	}
+
+	if !execNestShouldResetRawAfterDerivedSettleFailure(execNestDerivedSettleResetAfter) {
+		t.Fatalf("settle raw reset did not trigger at threshold")
+	}
+}
+
+func TestExecNestShouldClearBackoffAfterDerivedWarmup(t *testing.T) {
+	if !execNestShouldClearBackoffAfterDerivedWarmup(0) {
+		t.Fatalf("clean warmup should clear backoff")
+	}
+
+	if execNestShouldClearBackoffAfterDerivedWarmup(1) {
+		t.Fatalf("flapping warmup should keep backoff history")
+	}
+}
+
 func TestSourceSchemeHasMedia(t *testing.T) {
 	if sourceSchemeHasMedia(SourceSchemeStatus{}) {
 		t.Fatalf("empty status has media")

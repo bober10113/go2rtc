@@ -83,6 +83,7 @@ const (
 	execNestDerivedFlapSettle       = 5 * time.Second
 	execNestDerivedHardSettle       = 10 * time.Second
 	execNestDerivedRawResetAfter    = 3
+	execNestDerivedSettleResetAfter = 1
 	execNestDerivedStaleCheck       = 5 * time.Second
 	execNestDerivedStaleAfter       = 10 * time.Second
 )
@@ -232,8 +233,17 @@ func (p *Producer) Dial() error {
 		}
 		p.mu.Lock()
 		p.recoveringUntil = time.Time{}
-		p.clearExecNestBackoffLocked()
+		failures := p.recentExecNestFailuresLocked(time.Now())
+		if execNestShouldClearBackoffAfterDerivedWarmup(failures) {
+			p.clearExecNestBackoffLocked()
+		}
 		p.mu.Unlock()
+		if failures > 0 {
+			log.Warn().
+				Str("url", safeProducerURL(p.url)).
+				Int("failures", failures).
+				Msg("[streams] keep local nest backoff history after derived warmup")
+		}
 	}
 
 	return nil
@@ -519,9 +529,6 @@ func (p *Producer) waitLocalNestDerivedWarmupOwner(inputName string) error {
 				if err := p.waitLocalNestDerivedSettle(inputName, settleFor, packets, status.Bytes); err != nil {
 					return err
 				}
-				p.mu.Lock()
-				p.clearExecNestBackoffLocked()
-				p.mu.Unlock()
 				return nil
 			} else if packets > readyPackets {
 				readyPackets = packets
@@ -640,7 +647,7 @@ func (p *Producer) failLocalNestDerivedSettle(inputName string, startPackets, st
 	failures := p.execNestFailures
 	p.mu.Unlock()
 
-	resetRaw := execNestShouldResetRawAfterDerivedFailure(failures)
+	resetRaw := execNestShouldResetRawAfterDerivedSettleFailure(failures)
 	handled, changed, inactive := false, false, false
 	if resetRaw {
 		handled, changed, inactive = ResetIfSourceSchemeDetailed(inputName, "nest", "derived media settle failed")
@@ -660,6 +667,7 @@ func (p *Producer) failLocalNestDerivedSettle(inputName string, startPackets, st
 		Bool("h264_ready", status.H264Ready).
 		Stringer("backoff", wait.Round(time.Millisecond)).
 		Int("failures", failures).
+		Int("reset_after", execNestDerivedSettleResetAfter).
 		Bool("raw_available", rawOK).
 		Bool("reset_raw", resetRaw).
 		Bool("raw_handled", handled).
@@ -864,6 +872,14 @@ func execNestDerivedSettleDelay(severity int) time.Duration {
 
 func execNestShouldResetRawAfterDerivedFailure(failures int) bool {
 	return failures >= execNestDerivedRawResetAfter
+}
+
+func execNestShouldResetRawAfterDerivedSettleFailure(failures int) bool {
+	return failures >= execNestDerivedSettleResetAfter
+}
+
+func execNestShouldClearBackoffAfterDerivedWarmup(failures int) bool {
+	return failures <= 0
 }
 
 func sourceSchemeHasMedia(status SourceSchemeStatus) bool {
@@ -1276,7 +1292,15 @@ func (p *Producer) reconnect(workerID, retry int) {
 	_ = p.conn.Stop()
 	// swap connections
 	p.conn = conn
-	p.clearExecNestBackoffLocked()
+	failures := p.recentExecNestFailuresLocked(time.Now())
+	if !localNestDerived || execNestShouldClearBackoffAfterDerivedWarmup(failures) {
+		p.clearExecNestBackoffLocked()
+	} else {
+		log.Warn().
+			Str("url", safeProducerURL(p.url)).
+			Int("failures", failures).
+			Msg("[streams] keep local nest backoff history after derived reconnect")
+	}
 
 	go p.worker(conn, workerID)
 }
