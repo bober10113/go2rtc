@@ -763,20 +763,37 @@ func (p *Producer) resetLocalNestReadiness() {
 	p.localNestVideoPacketNsec.Store(0)
 }
 
+func (p *Producer) resetLocalNestReadinessForConsumerHandoff(codec *core.Codec) {
+	p.resetLocalNestReadiness()
+	p.seedLocalNestH264ParameterSets(codec)
+	log.Warn().
+		Str("url", safeProducerURL(p.url)).
+		Bool("h264_sps", p.localNestH264SPS.Load()).
+		Bool("h264_pps", p.localNestH264PPS.Load()).
+		Msg("[streams] reset local nest h264 readiness for consumer handoff")
+}
+
 func (p *Producer) armLocalNestH264Readiness(codec *core.Codec, track *core.Receiver) {
 	if track == nil || track.Input == nil {
 		return
 	}
 
-	if sps, pps := h264.GetParameterSet(codec.FmtpLine); len(sps) > 0 && len(pps) > 0 {
-		p.localNestH264SPS.Store(true)
-		p.localNestH264PPS.Store(true)
-	}
+	p.seedLocalNestH264ParameterSets(codec)
 
 	next := track.Input
 	track.Input = func(packet *core.Packet) {
 		p.observeLocalNestH264RTP(packet)
 		next(packet)
+	}
+}
+
+func (p *Producer) seedLocalNestH264ParameterSets(codec *core.Codec) {
+	if codec == nil {
+		return
+	}
+	if sps, pps := h264.GetParameterSet(codec.FmtpLine); len(sps) > 0 && len(pps) > 0 {
+		p.localNestH264SPS.Store(true)
+		p.localNestH264PPS.Store(true)
 	}
 }
 

@@ -52,6 +52,7 @@ func (s *Stream) AddConsumer(cons core.Consumer) (err error) {
 				}
 
 				var track *core.Receiver
+				localNestH264Handoff := false
 
 				switch prodMedia.Direction {
 				case core.DirectionRecvonly:
@@ -65,6 +66,7 @@ func (s *Stream) AddConsumer(cons core.Consumer) (err error) {
 					}
 
 					if _, ok := prod.localNestDerivedInput(); ok && core.GetKind(prodCodec.Name) == core.KindVideo {
+						localNestH264Handoff = prodCodec.Name == core.CodecH264
 						if err, checked := prodPrepared[prod]; checked {
 							if err != nil {
 								prodErrors[prodN] = err
@@ -85,6 +87,9 @@ func (s *Stream) AddConsumer(cons core.Consumer) (err error) {
 					if err = cons.AddTrack(consMedia, consCodec, track); err != nil {
 						log.Info().Err(err).Msg("[streams] can't add track")
 						continue
+					}
+					if localNestH264Handoff {
+						prod.resetLocalNestReadinessForConsumerHandoff(prodCodec)
 					}
 
 				case core.DirectionSendonly:

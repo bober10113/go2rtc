@@ -196,6 +196,31 @@ func TestLocalNestH264ReadinessFromFragmentedIDR(t *testing.T) {
 	}
 }
 
+func TestResetLocalNestReadinessForConsumerHandoffKeepsParameterSets(t *testing.T) {
+	prod := &Producer{}
+	codec := &core.Codec{
+		Name:     core.CodecH264,
+		FmtpLine: "packetization-mode=1;profile-level-id=64001f;sprop-parameter-sets=Z2QAH6wkhAFAFuwEQAAAAwBAAAAMI8YMkg==,aO4yyLA=",
+	}
+
+	prod.observeLocalNestH264Payload([]byte{h264.NALUTypeSPS})
+	prod.observeLocalNestH264Payload([]byte{h264.NALUTypePPS})
+	prod.observeLocalNestH264Payload([]byte{h264.NALUTypeIFrame})
+	prod.localNestVideoPacketNsec.Store(time.Now().UnixNano())
+
+	prod.resetLocalNestReadinessForConsumerHandoff(codec)
+
+	if !prod.localNestH264SPS.Load() || !prod.localNestH264PPS.Load() {
+		t.Fatalf("handoff reset did not preserve codec SPS/PPS")
+	}
+	if prod.localNestH264Keyframe.Load() {
+		t.Fatalf("handoff reset kept stale keyframe readiness")
+	}
+	if got := prod.localNestVideoPacketNsec.Load(); got != 0 {
+		t.Fatalf("handoff reset kept stale packet timestamp %d", got)
+	}
+}
+
 func TestExecNestDerivedWarmupSeverityUsesRecentStarts(t *testing.T) {
 	if got := execNestDerivedWarmupSeverity(0, 1); got != 0 {
 		t.Fatalf("severity for first start = %d, want 0", got)
