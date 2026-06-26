@@ -804,6 +804,89 @@ func (p *Producer) resetLocalNestReadinessForConsumerHandoff(codec *core.Codec) 
 		Msg("[streams] reset local nest h264 readiness for consumer handoff")
 }
 
+func (p *Producer) localNestH264HandoffReceiver(track *core.Receiver, codec *core.Codec) *core.Receiver {
+	if track == nil || track.Codec == nil {
+		return track
+	}
+
+	handoff := core.NewReceiver(track.Media, track.Codec)
+	next := handoff.Input
+	sps, pps := localNestH264ParameterSets(codec)
+	var keyframe, open bool
+	var dropped int
+	var buffered []*core.Packet
+
+	handoff.Input = func(packet *core.Packet) {
+		if packet == nil {
+			return
+		}
+		if open {
+			next(packet)
+			return
+		}
+
+		hasParameterSet := false
+		observeH264Payload(packet.Payload, func(naluType byte) {
+			switch naluType {
+			case h264.NALUTypeSPS:
+				sps = true
+				hasParameterSet = true
+			case h264.NALUTypePPS:
+				pps = true
+				hasParameterSet = true
+			case h264.NALUTypeIFrame:
+				keyframe = true
+			}
+		})
+		if hasParameterSet {
+			buffered = append(buffered, clonePacket(packet))
+			if len(buffered) > 8 {
+				buffered = buffered[len(buffered)-8:]
+			}
+		}
+
+		if sps && pps && keyframe {
+			open = true
+			log.Info().
+				Str("url", safeProducerURL(p.url)).
+				Int("dropped", dropped).
+				Int("buffered", len(buffered)).
+				Bool("h264_sps", sps).
+				Bool("h264_pps", pps).
+				Bool("h264_keyframe", keyframe).
+				Msg("[streams] local nest h264 handoff ready")
+			for _, bufferedPacket := range buffered {
+				next(bufferedPacket)
+			}
+			if !hasParameterSet {
+				next(packet)
+			}
+			buffered = nil
+			return
+		}
+
+		dropped++
+		if dropped == 1 || dropped%100 == 0 {
+			log.Warn().
+				Str("url", safeProducerURL(p.url)).
+				Int("dropped", dropped).
+				Int("buffered", len(buffered)).
+				Bool("h264_sps", sps).
+				Bool("h264_pps", pps).
+				Bool("h264_keyframe", keyframe).
+				Msg("[streams] drop local nest h264 packet before handoff ready")
+		}
+	}
+	handoff.Node.WithParent(&track.Node)
+
+	log.Warn().
+		Str("url", safeProducerURL(p.url)).
+		Bool("h264_sps", sps).
+		Bool("h264_pps", pps).
+		Msg("[streams] gate local nest h264 consumer handoff")
+	return handoff
+}
+
 func (p *Producer) armLocalNestH264Readiness(codec *core.Codec, track *core.Receiver) {
 	if track == nil || track.Input == nil {
 		return
@@ -819,13 +902,18 @@ func (p *Producer) armLocalNestH264Readiness(codec *core.Codec, track *core.Rece
 }
 
 func (p *Producer) seedLocalNestH264ParameterSets(codec *core.Codec) {
-	if codec == nil {
-		return
-	}
-	if sps, pps := h264.GetParameterSet(codec.FmtpLine); len(sps) > 0 && len(pps) > 0 {
+	if sps, pps := localNestH264ParameterSets(codec); sps && pps {
 		p.localNestH264SPS.Store(true)
 		p.localNestH264PPS.Store(true)
 	}
+}
+
+func localNestH264ParameterSets(codec *core.Codec) (bool, bool) {
+	if codec == nil {
+		return false, false
+	}
+	sps, pps := h264.GetParameterSet(codec.FmtpLine)
+	return len(sps) > 0, len(pps) > 0
 }
 
 func (p *Producer) observeLocalNestH264RTP(packet *core.Packet) {
@@ -837,13 +925,17 @@ func (p *Producer) observeLocalNestH264RTP(packet *core.Packet) {
 }
 
 func (p *Producer) observeLocalNestH264Payload(payload []byte) {
+	observeH264Payload(payload, p.observeLocalNestH264NALUType)
+}
+
+func observeH264Payload(payload []byte, observe func(byte)) {
 	if len(payload) == 0 {
 		return
 	}
 
 	switch payload[0] & 0x1F {
 	case h264.NALUTypeIFrame, h264.NALUTypeSPS, h264.NALUTypePPS:
-		p.observeLocalNestH264NALUType(payload[0] & 0x1F)
+		observe(payload[0] & 0x1F)
 	case 24: // STAP-A
 		for offset := 1; offset+2 <= len(payload); {
 			size := int(binary.BigEndian.Uint16(payload[offset:]))
@@ -851,15 +943,26 @@ func (p *Producer) observeLocalNestH264Payload(payload []byte) {
 			if size <= 0 || offset+size > len(payload) {
 				return
 			}
-			p.observeLocalNestH264NALUType(payload[offset] & 0x1F)
+			observe(payload[offset] & 0x1F)
 			offset += size
 		}
 	case 28: // FU-A
 		if len(payload) < 2 || payload[1]&0x80 == 0 {
 			return
 		}
-		p.observeLocalNestH264NALUType(payload[1] & 0x1F)
+		observe(payload[1] & 0x1F)
 	}
+}
+
+func clonePacket(packet *core.Packet) *core.Packet {
+	if packet == nil {
+		return nil
+	}
+	clone := *packet
+	if packet.Payload != nil {
+		clone.Payload = append([]byte(nil), packet.Payload...)
+	}
+	return &clone
 }
 
 func (p *Producer) observeLocalNestH264NALUType(naluType byte) {

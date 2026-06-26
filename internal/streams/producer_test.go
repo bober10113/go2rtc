@@ -221,6 +221,45 @@ func TestResetLocalNestReadinessForConsumerHandoffKeepsParameterSets(t *testing.
 	}
 }
 
+func TestLocalNestH264HandoffReceiverDropsUntilReady(t *testing.T) {
+	prod := &Producer{url: "exec:nest-test"}
+	codec := &core.Codec{Name: core.CodecH264}
+	track := core.NewReceiver(&core.Media{Kind: core.KindVideo}, codec)
+	handoff := prod.localNestH264HandoffReceiver(track, codec)
+	defer handoff.Close()
+
+	got := make(chan byte, 4)
+	sender := core.NewSender(nil, codec)
+	sender.Output = func(packet *core.Packet) {
+		got <- packet.Payload[0] & 0x1F
+	}
+	sender.HandleRTP(handoff)
+	defer sender.Close()
+
+	track.Input(&core.Packet{Payload: []byte{h264.NALUTypePFrame}})
+	select {
+	case naluType := <-got:
+		t.Fatalf("handoff forwarded early NALU type %d before readiness", naluType)
+	default:
+	}
+
+	track.Input(&core.Packet{Payload: []byte{h264.NALUTypeSPS}})
+	track.Input(&core.Packet{Payload: []byte{h264.NALUTypePPS}})
+	track.Input(&core.Packet{Payload: []byte{h264.NALUTypeIFrame}})
+
+	want := []byte{h264.NALUTypeSPS, h264.NALUTypePPS, h264.NALUTypeIFrame}
+	for _, expected := range want {
+		select {
+		case actual := <-got:
+			if actual != expected {
+				t.Fatalf("handoff forwarded NALU type %d, want %d", actual, expected)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for NALU type %d", expected)
+		}
+	}
+}
+
 func TestExecNestDerivedWarmupSeverityUsesRecentStarts(t *testing.T) {
 	if got := execNestDerivedWarmupSeverity(0, 1); got != 0 {
 		t.Fatalf("severity for first start = %d, want 0", got)

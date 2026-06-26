@@ -82,14 +82,17 @@ func (s *Stream) AddConsumer(cons core.Consumer) (err error) {
 							}
 						}
 					}
+					if localNestH264Handoff {
+						track = prod.localNestH264HandoffReceiver(track, prodCodec)
+					}
 
 					// Step 5. Add track to consumer
 					if err = cons.AddTrack(consMedia, consCodec, track); err != nil {
+						if localNestH264Handoff {
+							track.Close()
+						}
 						log.Info().Err(err).Msg("[streams] can't add track")
 						continue
-					}
-					if localNestH264Handoff {
-						prod.resetLocalNestReadinessForConsumerHandoff(prodCodec)
 					}
 
 				case core.DirectionSendonly:
