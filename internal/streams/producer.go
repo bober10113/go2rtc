@@ -36,16 +36,17 @@ type Producer struct {
 	receivers []*core.Receiver
 	senders   []*core.Receiver
 
-	state             state
-	mu                sync.Mutex
-	workerID          int
-	lastReset         time.Time
-	execNestFailures  int
-	execNestLastFail  time.Time
-	execNestStarts    int
-	execNestLastStart time.Time
-	recoveringUntil   time.Time
-	idleRecoverUntil  time.Time
+	state               state
+	mu                  sync.Mutex
+	workerID            int
+	lastReset           time.Time
+	execNestFailures    int
+	execNestLastFail    time.Time
+	execNestStarts      int
+	execNestLastStart   time.Time
+	recoveringUntil     time.Time
+	idleRecoverUntil    time.Time
+	localNestRecoveries int
 
 	localNestH264SPS         atomic.Bool
 	localNestH264PPS         atomic.Bool
@@ -474,6 +475,9 @@ func (p *Producer) waitLocalNestDerivedWarmupOwner(inputName string) error {
 	severity := execNestDerivedWarmupSeverity(failures, recentStarts)
 	timeout, stableFor, minPackets := execNestDerivedWarmupPolicy(severity)
 	settleFor := execNestDerivedSettleDelay(severity)
+	endRecoveryHold := p.beginLocalNestDerivedRecoveryHold(timeout + settleFor + deferredStopPadding)
+	defer endRecoveryHold()
+
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
 	ticker := time.NewTicker(execNestDerivedWarmupCheck)
@@ -630,6 +634,33 @@ func (p *Producer) waitLocalNestDerivedSettle(inputName string, settleFor time.D
 			return p.failLocalNestDerivedSettle(inputName, startPackets, startBytes, status, "settle expired without media growth")
 		case <-ticker.C:
 			status := p.videoMediaStatus()
+			if status.Ready() && (status.Packets < lastPackets || status.Bytes < lastBytes) {
+				log.Warn().
+					Str("url", safeProducerURL(p.url)).
+					Str("derived_input", inputName).
+					Int("packets_start", startPackets).
+					Int("packets_previous", lastPackets).
+					Int("packets_now", status.Packets).
+					Int("bytes_start", startBytes).
+					Int("bytes_previous", lastBytes).
+					Int("bytes_now", status.Bytes).
+					Bool("h264_required", status.H264Required).
+					Bool("h264_ready", status.H264Ready).
+					Stringer("settle", settleFor).
+					Msg("[streams] rebase local nest derived media settle after counter reset")
+				startPackets = status.Packets
+				startBytes = status.Bytes
+				lastPackets = status.Packets
+				lastBytes = status.Bytes
+				if !deadline.Stop() {
+					select {
+					case <-deadline.C:
+					default:
+					}
+				}
+				deadline.Reset(settleFor)
+				continue
+			}
 			if !status.Ready() || status.Packets <= lastPackets || status.Bytes <= lastBytes {
 				return p.failLocalNestDerivedSettle(inputName, startPackets, startBytes, status, "media stopped during settle")
 			}
@@ -1400,6 +1431,28 @@ func (p *Producer) clearExecNestBackoffLocked() {
 	p.execNestLastFail = time.Time{}
 }
 
+func (p *Producer) beginLocalNestDerivedRecoveryHold(duration time.Duration) func() {
+	if duration < deferredStopPadding {
+		duration = deferredStopPadding
+	}
+
+	p.mu.Lock()
+	p.localNestRecoveries++
+	until := time.Now().Add(duration)
+	if p.recoveringUntil.Before(until) {
+		p.recoveringUntil = until
+	}
+	p.mu.Unlock()
+
+	return func() {
+		p.mu.Lock()
+		if p.localNestRecoveries > 0 {
+			p.localNestRecoveries--
+		}
+		p.mu.Unlock()
+	}
+}
+
 func (p *Producer) hasReaders() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -1434,6 +1487,20 @@ func (p *Producer) deferStopDuringRecovery() bool {
 	p.mu.Lock()
 
 	now := time.Now()
+	activeRecovery := p.localNestRecoveries > 0
+	if activeRecovery {
+		rawURL := safeProducerURL(p.url)
+		p.mu.Unlock()
+
+		log.Warn().
+			Str("url", rawURL).
+			Stringer("wait", deferredStopPadding).
+			Msg("[streams] defer producer stop during active local nest recovery")
+
+		time.AfterFunc(deferredStopPadding, p.stopAfterDeferredRecovery)
+		return true
+	}
+
 	wait := p.recoveringUntil.Sub(now)
 	if wait <= 0 {
 		p.mu.Unlock()
@@ -1475,6 +1542,15 @@ func (p *Producer) stopAfterDeferredRecovery() {
 	}
 
 	now := time.Now()
+	if p.localNestRecoveries > 0 {
+		log.Warn().
+			Str("url", safeProducerURL(p.url)).
+			Stringer("wait", deferredStopPadding).
+			Msg("[streams] keep idle producer during active local nest recovery")
+		time.AfterFunc(deferredStopPadding, p.stopAfterDeferredRecovery)
+		return
+	}
+
 	if wait := p.recoveringUntil.Sub(now); wait > 0 && now.Before(p.idleRecoverUntil) {
 		if idleWait := p.idleRecoverUntil.Sub(now); idleWait < wait {
 			wait = idleWait

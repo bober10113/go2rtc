@@ -266,6 +266,31 @@ func TestMarkExecNestDerivedStartResetsAfterWindow(t *testing.T) {
 	}
 }
 
+func TestBeginLocalNestDerivedRecoveryHold(t *testing.T) {
+	prod := &Producer{}
+
+	done := prod.beginLocalNestDerivedRecoveryHold(time.Second)
+	prod.mu.Lock()
+	active := prod.localNestRecoveries
+	heldUntil := prod.recoveringUntil
+	prod.mu.Unlock()
+
+	if active != 1 {
+		t.Fatalf("active recoveries = %d, want 1", active)
+	}
+	if time.Until(heldUntil) <= 0 {
+		t.Fatalf("recovery hold was not set in the future")
+	}
+
+	done()
+	prod.mu.Lock()
+	active = prod.localNestRecoveries
+	prod.mu.Unlock()
+	if active != 0 {
+		t.Fatalf("active recoveries after done = %d, want 0", active)
+	}
+}
+
 func TestBeginExecNestDerivedRecoverySingleFlight(t *testing.T) {
 	resetExecNestDerivedRecoveryForTest()
 	defer resetExecNestDerivedRecoveryForTest()
