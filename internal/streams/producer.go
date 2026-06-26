@@ -400,8 +400,8 @@ func (p *Producer) waitLocalNestDerivedWarmup() error {
 				Int("raw_packets", status.Packets).
 				Int("raw_bytes", status.Bytes).
 				Bool("recovery_owner", false).
-				Msg("[streams] local nest derived recovery waiter still has no derived media")
-			return errors.New(execNestResetError)
+				Msg("[streams] local nest derived recovery waiter will use consumer handoff gate")
+			return nil
 		}
 		log.Warn().
 			Str("url", safeProducerURL(p.url)).
