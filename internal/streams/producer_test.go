@@ -225,7 +225,7 @@ func TestLocalNestH264HandoffReceiverDropsUntilReady(t *testing.T) {
 	prod := &Producer{url: "exec:nest-test"}
 	codec := &core.Codec{Name: core.CodecH264}
 	track := core.NewReceiver(&core.Media{Kind: core.KindVideo}, codec)
-	handoff := prod.localNestH264HandoffReceiver(track, codec)
+	handoff, ready := prod.localNestH264HandoffReceiver(track, codec)
 	defer handoff.Close()
 
 	got := make(chan byte, 4)
@@ -246,6 +246,12 @@ func TestLocalNestH264HandoffReceiverDropsUntilReady(t *testing.T) {
 	track.Input(&core.Packet{Payload: []byte{h264.NALUTypeSPS}})
 	track.Input(&core.Packet{Payload: []byte{h264.NALUTypePPS}})
 	track.Input(&core.Packet{Payload: []byte{h264.NALUTypeIFrame}})
+
+	select {
+	case <-ready:
+	case <-time.After(time.Second):
+		t.Fatalf("handoff readiness did not close")
+	}
 
 	want := []byte{h264.NALUTypeSPS, h264.NALUTypePPS, h264.NALUTypeIFrame}
 	for _, expected := range want {

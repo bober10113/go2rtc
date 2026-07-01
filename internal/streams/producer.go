@@ -85,6 +85,7 @@ const (
 	execNestDerivedHardSettle       = 10 * time.Second
 	execNestDerivedRawResetAfter    = 3
 	execNestDerivedSettleResetAfter = 1
+	execNestDerivedHandoffTimeout   = 20 * time.Second
 	execNestDerivedStaleCheck       = 5 * time.Second
 	execNestDerivedStaleAfter       = 10 * time.Second
 )
@@ -804,15 +805,18 @@ func (p *Producer) resetLocalNestReadinessForConsumerHandoff(codec *core.Codec) 
 		Msg("[streams] reset local nest h264 readiness for consumer handoff")
 }
 
-func (p *Producer) localNestH264HandoffReceiver(track *core.Receiver, codec *core.Codec) *core.Receiver {
+func (p *Producer) localNestH264HandoffReceiver(track *core.Receiver, codec *core.Codec) (*core.Receiver, <-chan struct{}) {
+	ready := make(chan struct{})
 	if track == nil || track.Codec == nil {
-		return track
+		close(ready)
+		return track, ready
 	}
 
 	handoff := core.NewReceiver(track.Media, track.Codec)
 	next := handoff.Input
 	sps, pps := localNestH264ParameterSets(codec)
 	var keyframe, open bool
+	var readyOnce sync.Once
 	var dropped int
 	var buffered []*core.Packet
 
@@ -847,6 +851,9 @@ func (p *Producer) localNestH264HandoffReceiver(track *core.Receiver, codec *cor
 
 		if sps && pps && keyframe {
 			open = true
+			readyOnce.Do(func() {
+				close(ready)
+			})
 			log.Info().
 				Str("url", safeProducerURL(p.url)).
 				Int("dropped", dropped).
@@ -884,7 +891,45 @@ func (p *Producer) localNestH264HandoffReceiver(track *core.Receiver, codec *cor
 		Bool("h264_sps", sps).
 		Bool("h264_pps", pps).
 		Msg("[streams] gate local nest h264 consumer handoff")
-	return handoff
+	return handoff, ready
+}
+
+func (p *Producer) waitLocalNestH264HandoffReady(inputName string, ready <-chan struct{}) error {
+	if ready == nil {
+		return nil
+	}
+
+	timer := time.NewTimer(execNestDerivedHandoffTimeout)
+	defer timer.Stop()
+
+	select {
+	case <-ready:
+		return nil
+	case <-timer.C:
+		status := p.videoMediaStatus()
+		p.mu.Lock()
+		wait := p.markExecNestBackoffLocked()
+		failures := p.execNestFailures
+		p.mu.Unlock()
+
+		handled, changed, inactive := ResetIfSourceSchemeDetailed(inputName, "nest", "derived h264 handoff timeout")
+		log.Warn().
+			Str("url", safeProducerURL(p.url)).
+			Str("derived_input", inputName).
+			Int("video_medias", status.Medias).
+			Int("packets", status.Packets).
+			Int("bytes", status.Bytes).
+			Bool("h264_required", status.H264Required).
+			Bool("h264_ready", status.H264Ready).
+			Stringer("timeout", execNestDerivedHandoffTimeout).
+			Stringer("backoff", wait.Round(time.Millisecond)).
+			Int("failures", failures).
+			Bool("raw_handled", handled).
+			Bool("raw_changed", changed).
+			Bool("raw_inactive", inactive).
+			Msg("[streams] local nest h264 handoff timeout")
+		return errors.New(execNestResetError)
+	}
 }
 
 func (p *Producer) armLocalNestH264Readiness(codec *core.Codec, track *core.Receiver) {

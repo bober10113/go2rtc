@@ -53,6 +53,8 @@ func (s *Stream) AddConsumer(cons core.Consumer) (err error) {
 
 				var track *core.Receiver
 				localNestH264Handoff := false
+				var localNestH264Ready <-chan struct{}
+				var localNestInputName string
 
 				switch prodMedia.Direction {
 				case core.DirectionRecvonly:
@@ -65,7 +67,8 @@ func (s *Stream) AddConsumer(cons core.Consumer) (err error) {
 						continue
 					}
 
-					if _, ok := prod.localNestDerivedInput(); ok && core.GetKind(prodCodec.Name) == core.KindVideo {
+					if inputName, ok := prod.localNestDerivedInput(); ok && core.GetKind(prodCodec.Name) == core.KindVideo {
+						localNestInputName = inputName
 						localNestH264Handoff = prodCodec.Name == core.CodecH264
 						if err, checked := prodPrepared[prod]; checked {
 							if err != nil {
@@ -83,7 +86,7 @@ func (s *Stream) AddConsumer(cons core.Consumer) (err error) {
 						}
 					}
 					if localNestH264Handoff {
-						track = prod.localNestH264HandoffReceiver(track, prodCodec)
+						track, localNestH264Ready = prod.localNestH264HandoffReceiver(track, prodCodec)
 					}
 
 					// Step 5. Add track to consumer
@@ -93,6 +96,13 @@ func (s *Stream) AddConsumer(cons core.Consumer) (err error) {
 						}
 						log.Info().Err(err).Msg("[streams] can't add track")
 						continue
+					}
+					if localNestH264Handoff {
+						if err = prod.waitLocalNestH264HandoffReady(localNestInputName, localNestH264Ready); err != nil {
+							track.Close()
+							prodErrors[prodN] = err
+							continue
+						}
 					}
 
 				case core.DirectionSendonly:
