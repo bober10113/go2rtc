@@ -244,7 +244,7 @@ func (p *Producer) Dial() error {
 			log.Warn().
 				Str("url", safeProducerURL(p.url)).
 				Int("failures", failures).
-				Msg("[streams] keep local nest backoff history after derived warmup")
+				Msg("[streams] clear stale local nest backoff after derived warmup")
 		}
 	}
 
@@ -425,19 +425,6 @@ func (p *Producer) waitLocalNestDerivedWarmupOwner(inputName string) error {
 	if wait := p.recoveringUntil.Sub(now); wait > 0 {
 		failures := p.recentExecNestFailuresLocked(now)
 		if status, ok := localNestSourceAvailableForDerived(inputName); ok {
-			if failures > 0 {
-				p.mu.Unlock()
-				log.Warn().
-					Str("url", safeProducerURL(p.url)).
-					Str("derived_input", inputName).
-					Stringer("wait", wait.Round(time.Millisecond)).
-					Int("raw_medias", status.Medias).
-					Int("raw_receivers", status.Receivers).
-					Int("raw_packets", status.Packets).
-					Int("failures", failures).
-					Msg("[streams] keep local nest derived recovery hold during publish backoff")
-				return errors.New(execNestResetError)
-			}
 			p.recoveringUntil = time.Time{}
 			p.mu.Unlock()
 			log.Warn().
@@ -447,6 +434,7 @@ func (p *Producer) waitLocalNestDerivedWarmupOwner(inputName string) error {
 				Int("raw_medias", status.Medias).
 				Int("raw_receivers", status.Receivers).
 				Int("raw_packets", status.Packets).
+				Int("failures", failures).
 				Msg("[streams] clear local nest derived recovery hold because raw media is present")
 		} else {
 			p.mu.Unlock()
@@ -1075,7 +1063,7 @@ func execNestShouldResetRawAfterDerivedSettleFailure(failures int) bool {
 }
 
 func execNestShouldClearBackoffAfterDerivedWarmup(failures int) bool {
-	return failures <= 0
+	return true
 }
 
 func sourceSchemeHasMedia(status SourceSchemeStatus) bool {
@@ -1491,6 +1479,12 @@ func (p *Producer) reconnect(workerID, retry int) {
 	failures := p.recentExecNestFailuresLocked(time.Now())
 	if !localNestDerived || execNestShouldClearBackoffAfterDerivedWarmup(failures) {
 		p.clearExecNestBackoffLocked()
+		if localNestDerived && failures > 0 {
+			log.Warn().
+				Str("url", safeProducerURL(p.url)).
+				Int("failures", failures).
+				Msg("[streams] clear stale local nest backoff after derived reconnect")
+		}
 	} else {
 		log.Warn().
 			Str("url", safeProducerURL(p.url)).

@@ -69,8 +69,12 @@ func TestExecNestShouldClearBackoffAfterDerivedWarmup(t *testing.T) {
 		t.Fatalf("clean warmup should clear backoff")
 	}
 
-	if execNestShouldClearBackoffAfterDerivedWarmup(1) {
-		t.Fatalf("flapping warmup should keep backoff history")
+	if !execNestShouldClearBackoffAfterDerivedWarmup(1) {
+		t.Fatalf("verified warmup should clear stale backoff history")
+	}
+
+	if !execNestShouldClearBackoffAfterDerivedWarmup(11) {
+		t.Fatalf("verified warmup should clear maxed stale backoff history")
 	}
 }
 
