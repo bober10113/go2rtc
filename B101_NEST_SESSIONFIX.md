@@ -12,15 +12,39 @@ This document intentionally avoids private camera names, device names, tokens, U
 
 ## Current Safe Candidate
 
-Current candidate: **v17 bad-media publish-probe test build**.
+Current candidate: **v60 derived-publish failure reset test build**.
 
-v17 keeps the safer recovery work and adds one targeted guard for the observed long-downtime loop:
+v60 is the current Frigate test binary installed as `/config/go2rtc` in the B101 Frigate CT at the time this note was updated.
 
-- If a Nest-derived local RTSP restream has already failed repeatedly, a brief `exec` publish is treated as a probe, not as full recovery.
-- The failure history is cleared only after the publish survives a short stability window.
-- This prevents a short-lived bad publish from resetting the circuit breaker back to failure count 1 while the same device is still in the same outage.
+Expected runtime version shape:
 
-This is intended to reduce repeated `GenerateWebRtcStream` / immediate `extend stopped` loops during bad-media recovery while still allowing quick recovery from a single short blip.
+```text
+go2rtc version 1.9.14+dev.<commit>.dirty (<commit>.dirty) linux/amd64
+```
+
+The `.dirty` suffix is expected for the first v60 test binary because it was built from the v59 branch tip plus the v60 local patch before this documentation commit archived it.
+
+v60 keeps the v52-v59 Nest media-readiness and recovery work, then adds one focused change:
+
+- If a local Nest-derived `exec:` RTSP publisher fails before it has produced usable media, go2rtc force-resets the matching raw `nest:` upstream even if that upstream still looks present.
+- The reset is limited to early-publish/media-timeout style failures, not every generic `exec` failure.
+- The intent is to avoid long downtime where Frigate keeps retrying a derived RTSP stream that exists in name but is not delivering usable media.
+
+This document intentionally avoids private camera names, private stream names, full device IDs, credential URLs, and tokens.
+
+## Recent Version Map
+
+The version labels below are test-build labels for the B101 branch. They are not upstream go2rtc release versions.
+
+- `b101-v52-baseline`: gate Nest derived media readiness before exposing a stream as usable.
+- `b101-v53-derived-settle`: reset the raw Nest stream when derived settle fails.
+- `b101-v54-h264-handoff`: reset H264 readiness after derived handoff.
+- `b101-v55-waiter-handoff`: let Nest derived waiters use the handoff gate.
+- `b101-v56-active-recovery-hold`: hold Nest derived producers during active recovery.
+- `b101-v57-h264-handoff-gate`: require H264 handoff packets before the consumer is considered ready.
+- `b101-v58-handoff-ready`: tighten Nest H264 handoff readiness before consumer use.
+- `b101-v59-derived-backoff-clear`: clear stale Nest derived backoff after media recovery.
+- `b101-v60-derived-publish-reset`: reset the raw Nest upstream after early derived publish/media failures.
 
 ## Canceled v10 Result
 

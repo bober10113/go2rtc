@@ -306,7 +306,28 @@ func resetLocalNestInput(args []string, reason string) bool {
 		return false
 	}
 
+	forceReset := localNestPublishFailureRequiresReset(reason)
 	if status, ok := localNestSourceAvailable(name); ok {
+		if forceReset {
+			handled, changed, inactive := streams.ResetIfSourceSchemeDetailed(name, "nest", reason)
+			ev := log.Warn().
+				Str("reason", reason).
+				Int("medias", status.Medias).
+				Int("receivers", status.Receivers).
+				Int("packets", status.Packets).
+				Bool("raw_handled", handled).
+				Bool("raw_changed", changed).
+				Bool("raw_inactive", inactive)
+			if changed {
+				wait := markLocalNestRecovery(name, reason, inactive)
+				ev.Stringer("wait", wait.Round(time.Millisecond)).
+					Msg("[exec] reset upstream nest stream after derived publish failure")
+			} else {
+				ev.Msg("[exec] upstream nest reset requested after derived publish failure")
+			}
+			return handled
+		}
+
 		if reason == "exec start timeout" {
 			reset, attempts := markLocalNestPublishTimeout(name, status)
 			if reset {
@@ -375,6 +396,17 @@ func resetLocalNestInput(args []string, reason string) bool {
 		return true
 	}
 	return false
+}
+
+func localNestPublishFailureRequiresReset(reason string) bool {
+	switch reason {
+	case "exec exited before publishing",
+		errLocalNestMediaTimeout.Error(),
+		"exec: local nest upstream exited before media":
+		return true
+	default:
+		return strings.Contains(reason, "before media")
+	}
 }
 
 func localNestInputName(args []string) (string, bool) {
