@@ -88,6 +88,7 @@ const (
 	execNestDerivedHandoffTimeout   = 20 * time.Second
 	execNestDerivedStaleCheck       = 5 * time.Second
 	execNestDerivedStaleAfter       = 10 * time.Second
+	execNestDerivedSettleStallGrace = 3 * time.Second
 )
 
 type SourceSchemeStatus struct {
@@ -96,6 +97,19 @@ type SourceSchemeStatus struct {
 	Receivers int
 	Packets   int
 	Bytes     int
+}
+
+func MediaCountersReset(startPackets, startBytes, packets, bytes int) bool {
+	return packets < startPackets || bytes < startBytes
+}
+
+func MediaCountersAdvanced(startPackets, startBytes, packets, bytes int) bool {
+	return packets > startPackets || bytes > startBytes
+}
+
+func MediaCountersChanged(startPackets, startBytes, packets, bytes int) bool {
+	return MediaCountersAdvanced(startPackets, startBytes, packets, bytes) ||
+		MediaCountersReset(startPackets, startBytes, packets, bytes)
 }
 
 type videoMediaStatus struct {
@@ -454,6 +468,7 @@ func (p *Producer) waitLocalNestDerivedWarmupOwner(inputName string) error {
 
 	startStatus := p.videoMediaStatus()
 	startMedias, startPackets, startBytes := startStatus.Medias, startStatus.Packets, startStatus.Bytes
+	rawStart := SourceSchemeStatusForStream(inputName, "nest")
 	recentStarts := 0
 	if startPackets == 0 {
 		p.mu.Lock()
@@ -499,6 +514,22 @@ func (p *Producer) waitLocalNestDerivedWarmupOwner(inputName string) error {
 	for {
 		status := p.videoMediaStatus()
 		medias, packets = status.Medias, status.Packets
+		if MediaCountersReset(startPackets, startBytes, status.Packets, status.Bytes) {
+			log.Warn().
+				Str("url", safeProducerURL(p.url)).
+				Str("derived_input", inputName).
+				Int("packets_start", startPackets).
+				Int("packets_now", status.Packets).
+				Int("bytes_start", startBytes).
+				Int("bytes_now", status.Bytes).
+				Msg("[streams] rebase local nest derived warmup after counter reset")
+			startMedias = status.Medias
+			startPackets = status.Packets
+			startBytes = status.Bytes
+			readySince = time.Time{}
+			readyPackets = 0
+			resetDurationTimer(deadline, timeout)
+		}
 		if status.Ready() && packets >= startPackets+minPackets && status.Bytes > startBytes {
 			if readySince.IsZero() {
 				readySince = time.Now()
@@ -534,12 +565,18 @@ func (p *Producer) waitLocalNestDerivedWarmupOwner(inputName string) error {
 		select {
 		case <-deadline.C:
 			rawStatus, rawOK := localNestSourceAvailableForDerived(inputName)
+			rawActivity := rawOK && MediaCountersChanged(
+				rawStart.Packets,
+				rawStart.Bytes,
+				rawStatus.Packets,
+				rawStatus.Bytes,
+			)
 			p.mu.Lock()
 			wait := p.markExecNestBackoffLocked()
 			failures := p.execNestFailures
 			p.mu.Unlock()
 
-			resetRaw := execNestShouldResetRawAfterDerivedFailure(failures)
+			resetRaw := execNestShouldResetRawAfterDerivedFailure(failures, rawActivity)
 			handled, changed, inactive := false, false, false
 			if resetRaw {
 				handled, changed, inactive = ResetIfSourceSchemeDetailed(inputName, "nest", "derived media timeout")
@@ -560,6 +597,7 @@ func (p *Producer) waitLocalNestDerivedWarmupOwner(inputName string) error {
 				Stringer("backoff", wait.Round(time.Millisecond)).
 				Int("failures", failures).
 				Bool("raw_available", rawOK).
+				Bool("raw_activity", rawActivity).
 				Bool("reset_raw", resetRaw).
 				Bool("raw_handled", handled).
 				Bool("raw_changed", changed).
@@ -591,6 +629,8 @@ func (p *Producer) waitLocalNestDerivedSettle(inputName string, settleFor time.D
 
 	lastPackets := startPackets
 	lastBytes := startBytes
+	rawStart := SourceSchemeStatusForStream(inputName, "nest")
+	var stalledSince time.Time
 	log.Warn().
 		Str("url", safeProducerURL(p.url)).
 		Str("derived_input", inputName).
@@ -620,10 +660,10 @@ func (p *Producer) waitLocalNestDerivedSettle(inputName string, settleFor time.D
 					Msg("[streams] local nest derived media settled")
 				return nil
 			}
-			return p.failLocalNestDerivedSettle(inputName, startPackets, startBytes, status, "settle expired without media growth")
+			return p.failLocalNestDerivedSettle(inputName, startPackets, startBytes, rawStart, status, "settle expired without media growth")
 		case <-ticker.C:
 			status := p.videoMediaStatus()
-			if status.Ready() && (status.Packets < lastPackets || status.Bytes < lastBytes) {
+			if MediaCountersReset(lastPackets, lastBytes, status.Packets, status.Bytes) {
 				log.Warn().
 					Str("url", safeProducerURL(p.url)).
 					Str("derived_input", inputName).
@@ -648,26 +688,41 @@ func (p *Producer) waitLocalNestDerivedSettle(inputName string, settleFor time.D
 					}
 				}
 				deadline.Reset(settleFor)
+				stalledSince = time.Time{}
 				continue
 			}
-			if !status.Ready() || status.Packets <= lastPackets || status.Bytes <= lastBytes {
-				return p.failLocalNestDerivedSettle(inputName, startPackets, startBytes, status, "media stopped during settle")
+			if status.Ready() && MediaCountersAdvanced(lastPackets, lastBytes, status.Packets, status.Bytes) {
+				lastPackets = status.Packets
+				lastBytes = status.Bytes
+				stalledSince = time.Time{}
+				continue
 			}
-			lastPackets = status.Packets
-			lastBytes = status.Bytes
+			if stalledSince.IsZero() {
+				stalledSince = time.Now()
+				continue
+			}
+			if execNestDerivedSettleStalled(stalledSince, time.Now()) {
+				return p.failLocalNestDerivedSettle(inputName, startPackets, startBytes, rawStart, status, "media stalled during settle")
+			}
 		}
 	}
 }
 
-func (p *Producer) failLocalNestDerivedSettle(inputName string, startPackets, startBytes int, status videoMediaStatus, reason string) error {
+func (p *Producer) failLocalNestDerivedSettle(inputName string, startPackets, startBytes int, rawStart SourceSchemeStatus, status videoMediaStatus, reason string) error {
 	rawStatus, rawOK := localNestSourceAvailableForDerived(inputName)
+	rawActivity := rawOK && MediaCountersChanged(
+		rawStart.Packets,
+		rawStart.Bytes,
+		rawStatus.Packets,
+		rawStatus.Bytes,
+	)
 
 	p.mu.Lock()
 	wait := p.markExecNestBackoffLocked()
 	failures := p.execNestFailures
 	p.mu.Unlock()
 
-	resetRaw := execNestShouldResetRawAfterDerivedSettleFailure(failures)
+	resetRaw := execNestShouldResetRawAfterDerivedSettleFailure(failures, rawActivity)
 	handled, changed, inactive := false, false, false
 	if resetRaw {
 		handled, changed, inactive = ResetIfSourceSchemeDetailed(inputName, "nest", "derived media settle failed")
@@ -689,6 +744,7 @@ func (p *Producer) failLocalNestDerivedSettle(inputName string, startPackets, st
 		Int("failures", failures).
 		Int("reset_after", execNestDerivedSettleResetAfter).
 		Bool("raw_available", rawOK).
+		Bool("raw_activity", rawActivity).
 		Bool("reset_raw", resetRaw).
 		Bool("raw_handled", handled).
 		Bool("raw_changed", changed).
@@ -702,6 +758,16 @@ func (p *Producer) failLocalNestDerivedSettle(inputName string, startPackets, st
 	}
 	ev.Msg("[streams] local nest derived media settle failed")
 	return errors.New(execNestResetError)
+}
+
+func resetDurationTimer(timer *time.Timer, duration time.Duration) {
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	timer.Reset(duration)
 }
 
 func beginExecNestDerivedRecovery(inputName string, now time.Time) (*execNestDerivedRecoveryCall, bool, int, time.Duration) {
@@ -1054,12 +1120,16 @@ func execNestDerivedSettleDelay(severity int) time.Duration {
 	}
 }
 
-func execNestShouldResetRawAfterDerivedFailure(failures int) bool {
-	return failures >= execNestDerivedRawResetAfter
+func execNestDerivedSettleStalled(stalledSince, now time.Time) bool {
+	return !stalledSince.IsZero() && now.Sub(stalledSince) >= execNestDerivedSettleStallGrace
 }
 
-func execNestShouldResetRawAfterDerivedSettleFailure(failures int) bool {
-	return failures >= execNestDerivedSettleResetAfter
+func execNestShouldResetRawAfterDerivedFailure(failures int, rawActivity bool) bool {
+	return failures >= execNestDerivedRawResetAfter && !rawActivity
+}
+
+func execNestShouldResetRawAfterDerivedSettleFailure(failures int, rawActivity bool) bool {
+	return failures >= execNestDerivedSettleResetAfter && !rawActivity
 }
 
 func execNestShouldClearBackoffAfterDerivedWarmup(failures int) bool {

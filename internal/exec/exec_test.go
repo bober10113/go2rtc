@@ -52,22 +52,6 @@ func TestLocalNestStatusAvailableUsesMediaPresence(t *testing.T) {
 	}
 }
 
-func TestLocalNestPublishFailureRequiresReset(t *testing.T) {
-	tests := map[string]bool{
-		"exec start timeout":                            false,
-		"exec exited before publishing":                 true,
-		errLocalNestMediaTimeout.Error():                true,
-		"exec: local nest upstream exited before media": true,
-		"unrelated failure":                             false,
-	}
-
-	for reason, want := range tests {
-		if got := localNestPublishFailureRequiresReset(reason); got != want {
-			t.Fatalf("reason %q reset = %v, want %v", reason, got, want)
-		}
-	}
-}
-
 func TestLocalNestPublishTimeoutResetsWhenRawPacketsAreMissing(t *testing.T) {
 	localNestRecovery.Lock()
 	localNestRecovery.state = map[string]localNestRecoveryState{}

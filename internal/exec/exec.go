@@ -306,28 +306,7 @@ func resetLocalNestInput(args []string, reason string) bool {
 		return false
 	}
 
-	forceReset := localNestPublishFailureRequiresReset(reason)
 	if status, ok := localNestSourceAvailable(name); ok {
-		if forceReset {
-			handled, changed, inactive := streams.ResetIfSourceSchemeDetailed(name, "nest", reason)
-			ev := log.Warn().
-				Str("reason", reason).
-				Int("medias", status.Medias).
-				Int("receivers", status.Receivers).
-				Int("packets", status.Packets).
-				Bool("raw_handled", handled).
-				Bool("raw_changed", changed).
-				Bool("raw_inactive", inactive)
-			if changed {
-				wait := markLocalNestRecovery(name, reason, inactive)
-				ev.Stringer("wait", wait.Round(time.Millisecond)).
-					Msg("[exec] reset upstream nest stream after derived publish failure")
-			} else {
-				ev.Msg("[exec] upstream nest reset requested after derived publish failure")
-			}
-			return handled
-		}
-
 		if reason == "exec start timeout" {
 			reset, attempts := markLocalNestPublishTimeout(name, status)
 			if reset {
@@ -396,17 +375,6 @@ func resetLocalNestInput(args []string, reason string) bool {
 		return true
 	}
 	return false
-}
-
-func localNestPublishFailureRequiresReset(reason string) bool {
-	switch reason {
-	case "exec exited before publishing",
-		errLocalNestMediaTimeout.Error(),
-		"exec: local nest upstream exited before media":
-		return true
-	default:
-		return strings.Contains(reason, "before media")
-	}
 }
 
 func localNestInputName(args []string) (string, bool) {
@@ -554,6 +522,8 @@ func waitLocalNestMediaReady(name string, cmd *shell.Command) error {
 
 	var readySince time.Time
 	var readyPackets int
+	startPackets := start.Packets
+	startBytes := start.Bytes
 
 	log.Warn().
 		Int("medias", start.Medias).
@@ -564,7 +534,20 @@ func waitLocalNestMediaReady(name string, cmd *shell.Command) error {
 
 	for {
 		status := streams.SourceSchemeStatusForStream(name, "nest")
-		if localNestMediaProgress(status, start.Packets, localNestMediaReadyMinPackets, true) {
+		if streams.MediaCountersReset(startPackets, startBytes, status.Packets, status.Bytes) {
+			log.Warn().
+				Int("packets_start", startPackets).
+				Int("packets_now", status.Packets).
+				Int("bytes_start", startBytes).
+				Int("bytes_now", status.Bytes).
+				Msg("[exec] rebase local nest upstream media wait after counter reset")
+			startPackets = status.Packets
+			startBytes = status.Bytes
+			readySince = time.Time{}
+			readyPackets = 0
+			resetDurationTimer(deadline, localNestMediaReadyTimeout)
+		}
+		if localNestMediaProgress(status, startPackets, localNestMediaReadyMinPackets, true) {
 			if readySince.IsZero() {
 				readySince = time.Now()
 				readyPackets = status.Packets
@@ -572,9 +555,9 @@ func waitLocalNestMediaReady(name string, cmd *shell.Command) error {
 				log.Info().
 					Int("medias", status.Medias).
 					Int("receivers", status.Receivers).
-					Int("packets_start", start.Packets).
+					Int("packets_start", startPackets).
 					Int("packets_now", status.Packets).
-					Int("packet_delta", status.Packets-start.Packets).
+					Int("packet_delta", status.Packets-startPackets).
 					Stringer("stable_for", time.Since(readySince).Round(time.Millisecond)).
 					Msg("[exec] local nest upstream media ready")
 				return nil
@@ -592,7 +575,7 @@ func waitLocalNestMediaReady(name string, cmd *shell.Command) error {
 				Bool("handled", status.Handled).
 				Int("medias", status.Medias).
 				Int("receivers", status.Receivers).
-				Int("packets_start", start.Packets).
+				Int("packets_start", startPackets).
 				Int("packets_now", status.Packets).
 				Msg("[exec] local nest upstream media wait ended by exec exit")
 			return errors.New("exec: local nest upstream exited before media")
@@ -601,13 +584,23 @@ func waitLocalNestMediaReady(name string, cmd *shell.Command) error {
 				Bool("handled", status.Handled).
 				Int("medias", status.Medias).
 				Int("receivers", status.Receivers).
-				Int("packets_start", start.Packets).
+				Int("packets_start", startPackets).
 				Int("packets_now", status.Packets).
 				Msg("[exec] local nest upstream media timeout")
 			return errLocalNestMediaTimeout
 		case <-ticker.C:
 		}
 	}
+}
+
+func resetDurationTimer(timer *time.Timer, duration time.Duration) {
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	timer.Reset(duration)
 }
 
 func localNestMediaProgress(status streams.SourceSchemeStatus, startPackets int, minPackets int, requireReceivers bool) bool {

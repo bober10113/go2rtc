@@ -45,22 +45,30 @@ func TestRecentExecNestFailuresIgnoresStaleFailures(t *testing.T) {
 }
 
 func TestExecNestShouldResetRawAfterDerivedFailure(t *testing.T) {
-	if execNestShouldResetRawAfterDerivedFailure(execNestDerivedRawResetAfter - 1) {
+	if execNestShouldResetRawAfterDerivedFailure(execNestDerivedRawResetAfter-1, false) {
 		t.Fatalf("raw reset triggered before threshold")
 	}
 
-	if !execNestShouldResetRawAfterDerivedFailure(execNestDerivedRawResetAfter) {
+	if !execNestShouldResetRawAfterDerivedFailure(execNestDerivedRawResetAfter, false) {
 		t.Fatalf("raw reset did not trigger at threshold")
+	}
+
+	if execNestShouldResetRawAfterDerivedFailure(execNestDerivedRawResetAfter, true) {
+		t.Fatalf("raw reset triggered while raw media was active")
 	}
 }
 
 func TestExecNestShouldResetRawAfterDerivedSettleFailure(t *testing.T) {
-	if execNestShouldResetRawAfterDerivedSettleFailure(execNestDerivedSettleResetAfter - 1) {
+	if execNestShouldResetRawAfterDerivedSettleFailure(execNestDerivedSettleResetAfter-1, false) {
 		t.Fatalf("settle raw reset triggered before threshold")
 	}
 
-	if !execNestShouldResetRawAfterDerivedSettleFailure(execNestDerivedSettleResetAfter) {
+	if !execNestShouldResetRawAfterDerivedSettleFailure(execNestDerivedSettleResetAfter, false) {
 		t.Fatalf("settle raw reset did not trigger at threshold")
+	}
+
+	if execNestShouldResetRawAfterDerivedSettleFailure(execNestDerivedSettleResetAfter, true) {
+		t.Fatalf("settle raw reset triggered while raw media was active")
 	}
 }
 
@@ -75,6 +83,58 @@ func TestExecNestShouldClearBackoffAfterDerivedWarmup(t *testing.T) {
 
 	if !execNestShouldClearBackoffAfterDerivedWarmup(11) {
 		t.Fatalf("verified warmup should clear maxed stale backoff history")
+	}
+}
+
+func TestMediaCountersReset(t *testing.T) {
+	if MediaCountersReset(10, 1000, 10, 1000) {
+		t.Fatal("unchanged counters were treated as reset")
+	}
+	if MediaCountersReset(10, 1000, 11, 1001) {
+		t.Fatal("growing counters were treated as reset")
+	}
+	if !MediaCountersReset(10, 1000, 9, 1001) {
+		t.Fatal("packet counter regression was not treated as reset")
+	}
+	if !MediaCountersReset(10, 1000, 11, 999) {
+		t.Fatal("byte counter regression was not treated as reset")
+	}
+}
+
+func TestMediaCountersAdvanced(t *testing.T) {
+	if MediaCountersAdvanced(10, 1000, 10, 1000) {
+		t.Fatal("unchanged counters were treated as progress")
+	}
+	if !MediaCountersAdvanced(10, 1000, 11, 1000) {
+		t.Fatal("packet growth was not treated as progress")
+	}
+	if !MediaCountersAdvanced(10, 1000, 10, 1001) {
+		t.Fatal("byte growth was not treated as progress")
+	}
+}
+
+func TestMediaCountersChanged(t *testing.T) {
+	if MediaCountersChanged(10, 1000, 10, 1000) {
+		t.Fatal("unchanged counters were treated as activity")
+	}
+	if !MediaCountersChanged(10, 1000, 11, 1001) {
+		t.Fatal("growing counters were not treated as activity")
+	}
+	if !MediaCountersChanged(10, 1000, 1, 100) {
+		t.Fatal("restarted counters were not treated as a new producer generation")
+	}
+}
+
+func TestExecNestDerivedSettleStalled(t *testing.T) {
+	now := time.Now()
+	if execNestDerivedSettleStalled(time.Time{}, now) {
+		t.Fatal("zero stall start was treated as stalled")
+	}
+	if execNestDerivedSettleStalled(now.Add(-execNestDerivedSettleStallGrace+time.Millisecond), now) {
+		t.Fatal("settle stalled before grace period elapsed")
+	}
+	if !execNestDerivedSettleStalled(now.Add(-execNestDerivedSettleStallGrace), now) {
+		t.Fatal("settle did not stall when grace period elapsed")
 	}
 }
 

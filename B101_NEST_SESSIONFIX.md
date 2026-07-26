@@ -10,25 +10,37 @@ dc1685e9cf7a8c349181f20a1b4a44825ed394c5
 
 This document intentionally avoids private camera names, device names, tokens, URLs, and full device IDs.
 
-## Current Safe Candidate
+## Current Live and Candidate State
 
-Current candidate: **v60 derived-publish failure reset test build**.
+Current live Frigate binary at the 2026-07-26 beta2 audit:
 
-v60 is the current Frigate test binary installed as `/config/go2rtc` in the B101 Frigate CT at the time this note was updated.
+```text
+go2rtc version 1.9.14+dev.854094f.dirty (854094f.dirty) linux/amd64
+```
+
+That is the **v59 derived-backoff-clear** build. The v60 source was archived on
+this branch, but v60 was not the live binary during this audit.
+
+Current source candidate: **v61 transient-settle and raw-preservation fix**.
+
+v61 is not deployed. It changes the v60 source in three conservative ways:
+
+- Allows a derived stream up to three seconds of no counter movement during its
+  settle probe instead of failing after one 500 ms sample.
+- Rebases readiness checks when packet or byte counters restart, which indicates
+  a replacement producer generation.
+- Does not reset a raw Nest producer when its media counters are advancing or
+  have restarted with usable media.
+
+v61 also removes v60's unconditional early-publish reset. Live evidence showed
+that this broader reset could discard a raw Nest session that was still
+delivering media.
 
 Expected runtime version shape:
 
 ```text
 go2rtc version 1.9.14+dev.<commit>.dirty (<commit>.dirty) linux/amd64
 ```
-
-The `.dirty` suffix is expected for the first v60 test binary because it was built from the v59 branch tip plus the v60 local patch before this documentation commit archived it.
-
-v60 keeps the v52-v59 Nest media-readiness and recovery work, then adds one focused change:
-
-- If a local Nest-derived `exec:` RTSP publisher fails before it has produced usable media, go2rtc force-resets the matching raw `nest:` upstream even if that upstream still looks present.
-- The reset is limited to early-publish/media-timeout style failures, not every generic `exec` failure.
-- The intent is to avoid long downtime where Frigate keeps retrying a derived RTSP stream that exists in name but is not delivering usable media.
 
 This document intentionally avoids private camera names, private stream names, full device IDs, credential URLs, and tokens.
 
@@ -44,7 +56,26 @@ The version labels below are test-build labels for the B101 branch. They are not
 - `b101-v57-h264-handoff-gate`: require H264 handoff packets before the consumer is considered ready.
 - `b101-v58-handoff-ready`: tighten Nest H264 handoff readiness before consumer use.
 - `b101-v59-derived-backoff-clear`: clear stale Nest derived backoff after media recovery.
-- `b101-v60-derived-publish-reset`: reset the raw Nest upstream after early derived publish/media failures.
+- `b101-v60-derived-publish-reset`: archived experiment that force-resets the raw Nest upstream after early derived publish/media failures; do not deploy as the next candidate.
+- `b101-v61-transient-settle`: tolerate short settle pauses and preserve a raw producer that is still showing media activity.
+
+## Frigate 0.18.0 Beta2 Audit
+
+The 2026-07-26 audit found no direct source or configuration conflict between
+Frigate `0.18.0-beta2` and this fork:
+
+- Frigate beta2 still bundles upstream go2rtc `v1.9.14`.
+- Frigate beta2 still defaults to FFmpeg 8.0 and includes FFmpeg 7.0 and 5.0.
+- The beta1-to-beta2 changes do not replace Frigate's go2rtc integration or the
+  custom `/config/go2rtc` override.
+- The compose configuration already provides
+  `GO2RTC_ALLOW_ARBITRARY_EXEC=true`, which is required by these derived
+  `exec:` streams.
+- The compose file validates successfully and the beta2 image manifest exists
+  for the current platform.
+
+The live compose, Frigate configuration, go2rtc configuration, and custom binary
+were backed up before this audit. Beta2 was not deployed as part of the audit.
 
 ## Canceled v10 Result
 
