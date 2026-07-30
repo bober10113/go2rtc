@@ -47,6 +47,7 @@ type Producer struct {
 	recoveringUntil     time.Time
 	idleRecoverUntil    time.Time
 	localNestRecoveries int
+	localNestDialing    bool
 
 	localNestH264SPS         atomic.Bool
 	localNestH264PPS         atomic.Bool
@@ -89,6 +90,8 @@ const (
 	execNestDerivedStaleCheck       = 5 * time.Second
 	execNestDerivedStaleAfter       = 10 * time.Second
 	execNestDerivedSettleStallGrace = 3 * time.Second
+	execNestDerivedDescribeWait     = 25 * time.Second
+	execNestRecoveryLogInterval     = 30 * time.Second
 )
 
 type SourceSchemeStatus struct {
@@ -131,11 +134,19 @@ type execNestDerivedRecoveryCall struct {
 	waiters int
 }
 
+type execNestDerivedRecoveryState struct {
+	call       *execNestDerivedRecoveryCall
+	changed    chan struct{}
+	parked     int
+	lastLogs   map[string]time.Time
+	suppressed map[string]int
+}
+
 var execNestDerivedRecovery = struct {
 	sync.Mutex
-	calls map[string]*execNestDerivedRecoveryCall
+	states map[string]*execNestDerivedRecoveryState
 }{
-	calls: map[string]*execNestDerivedRecoveryCall{},
+	states: map[string]*execNestDerivedRecoveryState{},
 }
 
 func NewProducer(source string) *Producer {
@@ -155,54 +166,15 @@ func (p *Producer) SetSource(s string) {
 }
 
 func (p *Producer) Dial() error {
+	if inputName, ok := p.localNestDerivedInput(); ok {
+		return p.dialLocalNestDerived(inputName)
+	}
+
 	p.mu.Lock()
 
 	if p.state != stateNone {
 		p.mu.Unlock()
 		return nil
-	}
-
-	if wait := time.Until(p.recoveringUntil); wait > 0 {
-		if inputName, ok := p.localNestDerivedInput(); ok {
-			if status, ok := localNestSourceAvailableForDerived(inputName); ok {
-				if p.recentExecNestFailuresLocked(time.Now()) > 0 {
-					log.Warn().
-						Str("url", safeProducerURL(p.url)).
-						Str("derived_input", inputName).
-						Stringer("wait", wait.Round(time.Millisecond)).
-						Int("raw_medias", status.Medias).
-						Int("raw_receivers", status.Receivers).
-						Int("raw_packets", status.Packets).
-						Int("failures", p.execNestFailures).
-						Msg("[streams] keep producer dial recovery during derived publish backoff")
-					p.mu.Unlock()
-					return errors.New(execNestResetError)
-				}
-				p.recoveringUntil = time.Time{}
-				log.Warn().
-					Str("url", safeProducerURL(p.url)).
-					Str("derived_input", inputName).
-					Stringer("wait", wait.Round(time.Millisecond)).
-					Int("raw_medias", status.Medias).
-					Int("raw_receivers", status.Receivers).
-					Int("raw_packets", status.Packets).
-					Msg("[streams] clear producer dial recovery because raw nest media is present")
-			} else {
-				log.Warn().
-					Str("url", safeProducerURL(p.url)).
-					Stringer("wait", wait.Round(time.Millisecond)).
-					Msg("[streams] skip producer dial during local nest recovery")
-				p.mu.Unlock()
-				return errors.New(execNestResetError)
-			}
-		} else {
-			log.Warn().
-				Str("url", safeProducerURL(p.url)).
-				Stringer("wait", wait.Round(time.Millisecond)).
-				Msg("[streams] skip producer dial during local nest recovery")
-			p.mu.Unlock()
-			return errors.New(execNestResetError)
-		}
 	}
 
 	if wait := time.Until(p.recoveringUntil); wait > 0 {
@@ -230,39 +202,149 @@ func (p *Producer) Dial() error {
 
 	p.conn = conn
 	p.state = stateMedias
-	_, localNestDerived := p.localNestDerivedInput()
-	hasVideoReceivers := p.hasVideoReceiversLocked()
-	if !localNestDerived {
-		p.recoveringUntil = time.Time{}
-		p.clearExecNestBackoffLocked()
-	} else {
-		p.resetLocalNestReadiness()
-	}
+	p.setExecNestRecoveryUntilLocked(time.Time{})
+	p.clearExecNestBackoffLocked()
 	p.mu.Unlock()
 
-	if localNestDerived && hasVideoReceivers {
-		if err := p.waitLocalNestDerivedWarmup(); err != nil {
-			p.mu.Lock()
-			p.stopLocked()
+	return nil
+}
+
+func (p *Producer) dialLocalNestDerived(inputName string) error {
+	deadline := time.Now().Add(execNestDerivedDescribeWait)
+
+	for {
+		p.mu.Lock()
+
+		if p.state != stateNone {
 			p.mu.Unlock()
+			return nil
+		}
+
+		now := time.Now()
+		wait := p.recoveringUntil.Sub(now)
+		if wait > 0 {
+			if status, ok := localNestSourceAvailableForDerived(inputName); ok && p.recentExecNestFailuresLocked(now) == 0 {
+				p.setExecNestRecoveryUntilLocked(time.Time{})
+				p.mu.Unlock()
+				log.Info().
+					Str("url", safeProducerURL(p.url)).
+					Str("derived_input", inputName).
+					Stringer("cleared_wait", wait.Round(time.Millisecond)).
+					Int("raw_medias", status.Medias).
+					Int("raw_receivers", status.Receivers).
+					Int("raw_packets", status.Packets).
+					Msg("[streams] clear producer dial recovery because raw nest media is present")
+				continue
+			}
+
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				p.mu.Unlock()
+				p.logExecNestRecovery(inputName, "describe_timeout", func(suppressed int) {
+					log.Warn().
+						Str("url", safeProducerURL(p.url)).
+						Str("derived_input", inputName).
+						Stringer("wait", wait.Round(time.Millisecond)).
+						Int("suppressed", suppressed).
+						Msg("[streams] local nest RTSP recovery wait expired")
+				})
+				return errors.New(execNestResetError)
+			}
+			if wait > remaining {
+				wait = remaining
+			}
+			change, parked := subscribeExecNestDerivedRecovery(inputName)
+			p.mu.Unlock()
+
+			p.logExecNestRecovery(inputName, "describe_park", func(suppressed int) {
+				log.Warn().
+					Str("url", safeProducerURL(p.url)).
+					Str("derived_input", inputName).
+					Stringer("wait", wait.Round(time.Millisecond)).
+					Int("waiters", parked).
+					Int("suppressed", suppressed).
+					Msg("[streams] park local nest RTSP request during recovery")
+			})
+			waitExecNestDerivedRecoveryChange(inputName, change, wait)
+			continue
+		}
+
+		if p.localNestDialing {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				p.mu.Unlock()
+				p.logExecNestRecovery(inputName, "owner_timeout", func(suppressed int) {
+					log.Warn().
+						Str("url", safeProducerURL(p.url)).
+						Str("derived_input", inputName).
+						Int("suppressed", suppressed).
+						Msg("[streams] local nest RTSP recovery owner wait expired")
+				})
+				return errors.New(execNestResetError)
+			}
+			change, parked := subscribeExecNestDerivedRecovery(inputName)
+			p.mu.Unlock()
+
+			p.logExecNestRecovery(inputName, "owner_wait", func(suppressed int) {
+				log.Warn().
+					Str("url", safeProducerURL(p.url)).
+					Str("derived_input", inputName).
+					Stringer("wait", remaining.Round(time.Millisecond)).
+					Int("waiters", parked).
+					Int("suppressed", suppressed).
+					Bool("recovery_owner", false).
+					Msg("[streams] join local nest RTSP recovery owner")
+			})
+			waitExecNestDerivedRecoveryChange(inputName, change, remaining)
+			continue
+		}
+
+		p.localNestDialing = true
+		p.mu.Unlock()
+
+		conn, err := GetProducer(p.url)
+
+		p.mu.Lock()
+		p.localNestDialing = false
+		if err != nil {
+			if strings.Contains(err.Error(), execNestResetError) {
+				wait = p.markExecNestBackoffLocked()
+				failures := p.execNestFailures
+				p.mu.Unlock()
+				notifyExecNestDerivedRecovery(inputName)
+				log.Warn().
+					Str("url", safeProducerURL(p.url)).
+					Str("derived_input", inputName).
+					Int("failures", failures).
+					Stringer("wait", wait.Round(time.Millisecond)).
+					Bool("recovery_owner", true).
+					Msg("[streams] local nest derived producer backoff")
+				return err
+			}
+			p.mu.Unlock()
+			notifyExecNestDerivedRecovery(inputName)
 			return err
 		}
-		p.mu.Lock()
-		p.recoveringUntil = time.Time{}
-		failures := p.recentExecNestFailuresLocked(time.Now())
-		if execNestShouldClearBackoffAfterDerivedWarmup(failures) {
-			p.clearExecNestBackoffLocked()
-		}
-		p.mu.Unlock()
-		if failures > 0 {
-			log.Warn().
-				Str("url", safeProducerURL(p.url)).
-				Int("failures", failures).
-				Msg("[streams] clear stale local nest backoff after derived warmup")
-		}
-	}
 
-	return nil
+		p.conn = conn
+		p.state = stateMedias
+		p.resetLocalNestReadiness()
+		hasVideoReceivers := p.hasVideoReceiversLocked()
+		p.mu.Unlock()
+		notifyExecNestDerivedRecovery(inputName)
+
+		if hasVideoReceivers {
+			if err = p.waitLocalNestDerivedWarmup(); err != nil {
+				p.mu.Lock()
+				p.stopLocked()
+				p.mu.Unlock()
+				return err
+			}
+			p.markLocalNestDerivedReady(inputName, "derived warmup")
+		}
+
+		return nil
+	}
 }
 
 func (p *Producer) GetMedias() []*core.Media {
@@ -392,14 +474,33 @@ func (p *Producer) waitLocalNestDerivedWarmup() error {
 
 	call, owner, waiters, age := beginExecNestDerivedRecovery(inputName, time.Now())
 	if !owner {
-		log.Warn().
-			Str("url", safeProducerURL(p.url)).
-			Str("derived_input", inputName).
-			Int("waiters", waiters).
-			Stringer("existing_recovery_age", age.Round(time.Millisecond)).
-			Bool("recovery_owner", false).
-			Msg("[streams] join local nest derived media recovery")
-		<-call.done
+		p.logExecNestRecovery(inputName, "warmup_join", func(suppressed int) {
+			log.Warn().
+				Str("url", safeProducerURL(p.url)).
+				Str("derived_input", inputName).
+				Int("waiters", waiters).
+				Stringer("existing_recovery_age", age.Round(time.Millisecond)).
+				Int("suppressed", suppressed).
+				Bool("recovery_owner", false).
+				Msg("[streams] join local nest derived media recovery")
+		})
+		timer := time.NewTimer(execNestDerivedDescribeWait)
+		select {
+		case <-call.done:
+			timer.Stop()
+		case <-timer.C:
+			p.logExecNestRecovery(inputName, "warmup_wait_timeout", func(suppressed int) {
+				log.Warn().
+					Str("url", safeProducerURL(p.url)).
+					Str("derived_input", inputName).
+					Int("waiters", waiters).
+					Stringer("wait", execNestDerivedDescribeWait).
+					Int("suppressed", suppressed).
+					Bool("recovery_owner", false).
+					Msg("[streams] local nest derived recovery waiter expired")
+			})
+			return errors.New(execNestResetError)
+		}
 		if call.err != nil {
 			return call.err
 		}
@@ -419,12 +520,15 @@ func (p *Producer) waitLocalNestDerivedWarmup() error {
 				Msg("[streams] local nest derived recovery waiter will use consumer handoff gate")
 			return nil
 		}
-		log.Warn().
-			Str("url", safeProducerURL(p.url)).
-			Str("derived_input", inputName).
-			Int("waiters", waiters).
-			Bool("recovery_owner", false).
-			Msg("[streams] local nest derived recovery waiter has no media")
+		p.logExecNestRecovery(inputName, "warmup_no_media", func(suppressed int) {
+			log.Warn().
+				Str("url", safeProducerURL(p.url)).
+				Str("derived_input", inputName).
+				Int("waiters", waiters).
+				Int("suppressed", suppressed).
+				Bool("recovery_owner", false).
+				Msg("[streams] local nest derived recovery waiter has no media")
+		})
 		return errors.New(execNestResetError)
 	}
 
@@ -439,7 +543,7 @@ func (p *Producer) waitLocalNestDerivedWarmupOwner(inputName string) error {
 	if wait := p.recoveringUntil.Sub(now); wait > 0 {
 		failures := p.recentExecNestFailuresLocked(now)
 		if status, ok := localNestSourceAvailableForDerived(inputName); ok {
-			p.recoveringUntil = time.Time{}
+			p.setExecNestRecoveryUntilLocked(time.Time{})
 			p.mu.Unlock()
 			log.Warn().
 				Str("url", safeProducerURL(p.url)).
@@ -553,6 +657,7 @@ func (p *Producer) waitLocalNestDerivedWarmupOwner(inputName string) error {
 				if err := p.waitLocalNestDerivedSettle(inputName, settleFor, packets, status.Bytes); err != nil {
 					return err
 				}
+				p.markLocalNestDerivedReady(inputName, "derived media ready")
 				return nil
 			} else if packets > readyPackets {
 				readyPackets = packets
@@ -774,11 +879,8 @@ func beginExecNestDerivedRecovery(inputName string, now time.Time) (*execNestDer
 	execNestDerivedRecovery.Lock()
 	defer execNestDerivedRecovery.Unlock()
 
-	if execNestDerivedRecovery.calls == nil {
-		execNestDerivedRecovery.calls = map[string]*execNestDerivedRecoveryCall{}
-	}
-
-	if call := execNestDerivedRecovery.calls[inputName]; call != nil {
+	state := execNestDerivedRecoveryStateLocked(inputName)
+	if call := state.call; call != nil {
 		call.waiters++
 		return call, false, call.waiters, now.Sub(call.started)
 	}
@@ -787,7 +889,8 @@ func beginExecNestDerivedRecovery(inputName string, now time.Time) (*execNestDer
 		done:    make(chan struct{}),
 		started: now,
 	}
-	execNestDerivedRecovery.calls[inputName] = call
+	state.call = call
+	notifyExecNestDerivedRecoveryLocked(state)
 	return call, true, 0, 0
 }
 
@@ -795,11 +898,91 @@ func finishExecNestDerivedRecovery(inputName string, call *execNestDerivedRecove
 	execNestDerivedRecovery.Lock()
 	defer execNestDerivedRecovery.Unlock()
 
-	if execNestDerivedRecovery.calls[inputName] == call {
-		delete(execNestDerivedRecovery.calls, inputName)
+	state := execNestDerivedRecoveryStateLocked(inputName)
+	if state.call == call {
+		state.call = nil
 	}
 	call.err = err
 	close(call.done)
+	notifyExecNestDerivedRecoveryLocked(state)
+}
+
+func execNestDerivedRecoveryStateLocked(inputName string) *execNestDerivedRecoveryState {
+	if execNestDerivedRecovery.states == nil {
+		execNestDerivedRecovery.states = map[string]*execNestDerivedRecoveryState{}
+	}
+	state := execNestDerivedRecovery.states[inputName]
+	if state == nil {
+		state = &execNestDerivedRecoveryState{
+			changed:    make(chan struct{}),
+			lastLogs:   map[string]time.Time{},
+			suppressed: map[string]int{},
+		}
+		execNestDerivedRecovery.states[inputName] = state
+	}
+	return state
+}
+
+func subscribeExecNestDerivedRecovery(inputName string) (<-chan struct{}, int) {
+	execNestDerivedRecovery.Lock()
+	defer execNestDerivedRecovery.Unlock()
+
+	state := execNestDerivedRecoveryStateLocked(inputName)
+	state.parked++
+	return state.changed, state.parked
+}
+
+func waitExecNestDerivedRecoveryChange(inputName string, changed <-chan struct{}, wait time.Duration) bool {
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+
+	var signaled bool
+	select {
+	case <-changed:
+		signaled = true
+	case <-timer.C:
+	}
+
+	execNestDerivedRecovery.Lock()
+	state := execNestDerivedRecoveryStateLocked(inputName)
+	if state.parked > 0 {
+		state.parked--
+	}
+	execNestDerivedRecovery.Unlock()
+	return signaled
+}
+
+func notifyExecNestDerivedRecovery(inputName string) {
+	execNestDerivedRecovery.Lock()
+	state := execNestDerivedRecoveryStateLocked(inputName)
+	notifyExecNestDerivedRecoveryLocked(state)
+	execNestDerivedRecovery.Unlock()
+}
+
+func notifyExecNestDerivedRecoveryLocked(state *execNestDerivedRecoveryState) {
+	close(state.changed)
+	state.changed = make(chan struct{})
+}
+
+func allowExecNestRecoveryLog(inputName, event string, now time.Time) (bool, int) {
+	execNestDerivedRecovery.Lock()
+	defer execNestDerivedRecovery.Unlock()
+
+	state := execNestDerivedRecoveryStateLocked(inputName)
+	if last := state.lastLogs[event]; !last.IsZero() && now.Sub(last) < execNestRecoveryLogInterval {
+		state.suppressed[event]++
+		return false, 0
+	}
+	suppressed := state.suppressed[event]
+	state.suppressed[event] = 0
+	state.lastLogs[event] = now
+	return true, suppressed
+}
+
+func (p *Producer) logExecNestRecovery(inputName, event string, write func(int)) {
+	if allowed, suppressed := allowExecNestRecoveryLog(inputName, event, time.Now()); allowed {
+		write(suppressed)
+	}
 }
 
 func (s videoMediaStatus) Ready() bool {
@@ -847,6 +1030,9 @@ func (p *Producer) resetLocalNestReadiness() {
 	p.localNestH264PPS.Store(false)
 	p.localNestH264Keyframe.Store(false)
 	p.localNestVideoPacketNsec.Store(0)
+	if inputName, ok := p.localNestDerivedInput(); ok {
+		notifyExecNestDerivedRecovery(inputName)
+	}
 }
 
 func (p *Producer) resetLocalNestReadinessForConsumerHandoff(codec *core.Codec) {
@@ -1065,6 +1251,7 @@ func clonePacket(packet *core.Packet) *core.Packet {
 }
 
 func (p *Producer) observeLocalNestH264NALUType(naluType byte) {
+	wasReady := p.localNestH264SPS.Load() && p.localNestH264PPS.Load() && p.localNestH264Keyframe.Load()
 	switch naluType {
 	case h264.NALUTypeIFrame:
 		p.localNestH264Keyframe.Store(true)
@@ -1072,6 +1259,11 @@ func (p *Producer) observeLocalNestH264NALUType(naluType byte) {
 		p.localNestH264SPS.Store(true)
 	case h264.NALUTypePPS:
 		p.localNestH264PPS.Store(true)
+	}
+	if !wasReady && p.localNestH264SPS.Load() && p.localNestH264PPS.Load() && p.localNestH264Keyframe.Load() {
+		if inputName, ok := p.localNestDerivedInput(); ok {
+			notifyExecNestDerivedRecovery(inputName)
+		}
 	}
 }
 
@@ -1315,7 +1507,7 @@ func (p *Producer) hold(reason string, duration time.Duration) bool {
 
 	until := time.Now().Add(duration)
 	if p.recoveringUntil.Before(until) {
-		p.recoveringUntil = until
+		p.setExecNestRecoveryUntilLocked(until)
 	}
 
 	log.Warn().
@@ -1462,7 +1654,7 @@ func (p *Producer) stopLocalNestDerivedStale(workerID int, inputName string, sta
 	wait := p.markExecNestBackoffLocked()
 	failures := p.execNestFailures
 	p.stopLocked()
-	p.recoveringUntil = time.Now().Add(wait)
+	p.setExecNestRecoveryUntilLocked(time.Now().Add(wait))
 	p.mu.Unlock()
 
 	log.Warn().
@@ -1506,7 +1698,7 @@ func (p *Producer) reconnect(workerID, retry int) {
 	if localNestDerived {
 		p.resetLocalNestReadiness()
 	}
-	p.recoveringUntil = time.Time{}
+	p.setExecNestRecoveryUntilLocked(time.Time{})
 
 	for _, media := range conn.GetMedias() {
 		switch media.Direction {
@@ -1569,20 +1761,20 @@ func (p *Producer) reconnectBackoff(retry int, err error) time.Duration {
 	if err != nil && strings.Contains(err.Error(), execNestResetError) {
 		timeout := execNestResetBackoff
 		if retry < 3 {
-			p.recoveringUntil = time.Now().Add(timeout)
+			p.setExecNestRecoveryUntilLocked(time.Now().Add(timeout))
 			return timeout
 		}
 		if retry < 8 {
 			timeout = 30 * time.Second
-			p.recoveringUntil = time.Now().Add(timeout)
+			p.setExecNestRecoveryUntilLocked(time.Now().Add(timeout))
 			return timeout
 		}
 		timeout = time.Minute
-		p.recoveringUntil = time.Now().Add(timeout)
+		p.setExecNestRecoveryUntilLocked(time.Now().Add(timeout))
 		return timeout
 	}
 
-	p.recoveringUntil = time.Time{}
+	p.setExecNestRecoveryUntilLocked(time.Time{})
 
 	timeout := time.Minute
 	if retry < 5 {
@@ -1617,7 +1809,7 @@ func (p *Producer) markExecNestBackoffLocked() time.Duration {
 	case p.execNestFailures >= 3:
 		timeout = execNestBackoffMedium
 	}
-	p.recoveringUntil = now.Add(timeout)
+	p.setExecNestRecoveryUntilLocked(now.Add(timeout))
 
 	return timeout
 }
@@ -1643,6 +1835,37 @@ func (p *Producer) clearExecNestBackoffLocked() {
 	p.execNestLastFail = time.Time{}
 }
 
+func (p *Producer) setExecNestRecoveryUntilLocked(until time.Time) {
+	if p.recoveringUntil.Equal(until) {
+		return
+	}
+	p.recoveringUntil = until
+	if inputName, ok := p.localNestDerivedInput(); ok {
+		notifyExecNestDerivedRecovery(inputName)
+	}
+}
+
+func (p *Producer) markLocalNestDerivedReady(inputName, reason string) {
+	p.mu.Lock()
+	failures := p.recentExecNestFailuresLocked(time.Now())
+	hadBackoff := failures > 0 || !p.recoveringUntil.IsZero()
+	p.setExecNestRecoveryUntilLocked(time.Time{})
+	p.clearExecNestBackoffLocked()
+	p.mu.Unlock()
+
+	if hadBackoff {
+		log.Info().
+			Str("url", safeProducerURL(p.url)).
+			Str("derived_input", inputName).
+			Str("reason", reason).
+			Int("previous_failures", failures).
+			Bool("h264_sps", p.localNestH264SPS.Load()).
+			Bool("h264_pps", p.localNestH264PPS.Load()).
+			Bool("h264_keyframe", p.localNestH264Keyframe.Load()).
+			Msg("[streams] clear local nest recovery after verified media")
+	}
+}
+
 func (p *Producer) beginLocalNestDerivedRecoveryHold(duration time.Duration) func() {
 	if duration < deferredStopPadding {
 		duration = deferredStopPadding
@@ -1652,7 +1875,7 @@ func (p *Producer) beginLocalNestDerivedRecoveryHold(duration time.Duration) fun
 	p.localNestRecoveries++
 	until := time.Now().Add(duration)
 	if p.recoveringUntil.Before(until) {
-		p.recoveringUntil = until
+		p.setExecNestRecoveryUntilLocked(until)
 	}
 	p.mu.Unlock()
 
@@ -1702,12 +1925,18 @@ func (p *Producer) deferStopDuringRecovery() bool {
 	activeRecovery := p.localNestRecoveries > 0
 	if activeRecovery {
 		rawURL := safeProducerURL(p.url)
+		inputName, localNestDerived := p.localNestDerivedInput()
 		p.mu.Unlock()
 
-		log.Warn().
-			Str("url", rawURL).
-			Stringer("wait", deferredStopPadding).
-			Msg("[streams] defer producer stop during active local nest recovery")
+		if localNestDerived {
+			p.logExecNestRecovery(inputName, "defer_active_stop", func(suppressed int) {
+				log.Warn().
+					Str("url", rawURL).
+					Stringer("wait", deferredStopPadding).
+					Int("suppressed", suppressed).
+					Msg("[streams] defer producer stop during active local nest recovery")
+			})
+		}
 
 		time.AfterFunc(deferredStopPadding, p.stopAfterDeferredRecovery)
 		return true
@@ -1733,12 +1962,18 @@ func (p *Producer) deferStopDuringRecovery() bool {
 	}
 	wait += deferredStopPadding
 	rawURL := safeProducerURL(p.url)
+	inputName, localNestDerived := p.localNestDerivedInput()
 	p.mu.Unlock()
 
-	log.Warn().
-		Str("url", rawURL).
-		Stringer("wait", wait.Round(time.Millisecond)).
-		Msg("[streams] defer producer stop during local nest recovery")
+	if localNestDerived {
+		p.logExecNestRecovery(inputName, "defer_recovery_stop", func(suppressed int) {
+			log.Warn().
+				Str("url", rawURL).
+				Stringer("wait", wait.Round(time.Millisecond)).
+				Int("suppressed", suppressed).
+				Msg("[streams] defer producer stop during local nest recovery")
+		})
+	}
 
 	time.AfterFunc(wait, p.stopAfterDeferredRecovery)
 	return true
@@ -1755,10 +1990,15 @@ func (p *Producer) stopAfterDeferredRecovery() {
 
 	now := time.Now()
 	if p.localNestRecoveries > 0 {
-		log.Warn().
-			Str("url", safeProducerURL(p.url)).
-			Stringer("wait", deferredStopPadding).
-			Msg("[streams] keep idle producer during active local nest recovery")
+		if inputName, ok := p.localNestDerivedInput(); ok {
+			p.logExecNestRecovery(inputName, "keep_idle_active", func(suppressed int) {
+				log.Warn().
+					Str("url", safeProducerURL(p.url)).
+					Stringer("wait", deferredStopPadding).
+					Int("suppressed", suppressed).
+					Msg("[streams] keep idle producer during active local nest recovery")
+			})
+		}
 		time.AfterFunc(deferredStopPadding, p.stopAfterDeferredRecovery)
 		return
 	}
@@ -1807,7 +2047,7 @@ func (p *Producer) stopLocked() {
 	p.state = stateNone
 	p.receivers = nil
 	p.senders = nil
-	p.recoveringUntil = time.Time{}
+	p.setExecNestRecoveryUntilLocked(time.Time{})
 	p.idleRecoverUntil = time.Time{}
 }
 

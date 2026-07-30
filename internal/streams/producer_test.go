@@ -449,10 +449,59 @@ func TestBeginExecNestDerivedRecoverySingleFlight(t *testing.T) {
 	finishExecNestDerivedRecovery("nest_raw", next, nil)
 }
 
+func TestExecNestDerivedRecoveryNotifiesParkedWaiters(t *testing.T) {
+	resetExecNestDerivedRecoveryForTest()
+	defer resetExecNestDerivedRecoveryForTest()
+
+	changed, parked := subscribeExecNestDerivedRecovery("nest_raw")
+	if parked != 1 {
+		t.Fatalf("parked waiters = %d, want 1", parked)
+	}
+
+	notifyExecNestDerivedRecovery("nest_raw")
+	if !waitExecNestDerivedRecoveryChange("nest_raw", changed, time.Second) {
+		t.Fatal("parked waiter did not observe recovery change")
+	}
+
+	execNestDerivedRecovery.Lock()
+	state := execNestDerivedRecovery.states["nest_raw"]
+	remaining := state.parked
+	execNestDerivedRecovery.Unlock()
+	if remaining != 0 {
+		t.Fatalf("parked waiters after wake = %d, want 0", remaining)
+	}
+}
+
+func TestExecNestRecoveryLogsAreRateLimitedPerEvent(t *testing.T) {
+	resetExecNestDerivedRecoveryForTest()
+	defer resetExecNestDerivedRecoveryForTest()
+
+	now := time.Now()
+	if allowed, suppressed := allowExecNestRecoveryLog("nest_raw", "park", now); !allowed || suppressed != 0 {
+		t.Fatalf("first event allowed=%t suppressed=%d, want true/0", allowed, suppressed)
+	}
+	if allowed, _ := allowExecNestRecoveryLog("nest_raw", "park", now.Add(time.Second)); allowed {
+		t.Fatal("duplicate event was not rate limited")
+	}
+	if allowed, suppressed := allowExecNestRecoveryLog("nest_raw", "timeout", now.Add(time.Second)); !allowed || suppressed != 0 {
+		t.Fatalf("separate event allowed=%t suppressed=%d, want true/0", allowed, suppressed)
+	}
+	if allowed, suppressed := allowExecNestRecoveryLog("nest_raw", "park", now.Add(execNestRecoveryLogInterval)); !allowed || suppressed != 1 {
+		t.Fatalf("event after interval allowed=%t suppressed=%d, want true/1", allowed, suppressed)
+	}
+}
+
+func TestExecNestDerivedDescribeWaitStaysBelowFrigateRTSPTimeout(t *testing.T) {
+	const frigateRTSPTimeout = 30 * time.Second
+	if execNestDerivedDescribeWait >= frigateRTSPTimeout {
+		t.Fatalf("derived DESCRIBE wait = %s, must be below %s", execNestDerivedDescribeWait, frigateRTSPTimeout)
+	}
+}
+
 func resetExecNestDerivedRecoveryForTest() {
 	execNestDerivedRecovery.Lock()
 	defer execNestDerivedRecovery.Unlock()
-	execNestDerivedRecovery.calls = map[string]*execNestDerivedRecoveryCall{}
+	execNestDerivedRecovery.states = map[string]*execNestDerivedRecoveryState{}
 }
 
 type sourceStatsProducer struct {

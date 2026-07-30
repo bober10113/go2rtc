@@ -12,29 +12,31 @@ This document intentionally avoids private camera names, device names, tokens, U
 
 ## Current Live and Candidate State
 
-Current live Frigate binary at the 2026-07-26 beta2 audit:
+Current live Frigate binary before the 2026-07-30 v62 deployment:
 
 ```text
-go2rtc version 1.9.14+dev.854094f.dirty (854094f.dirty) linux/amd64
+go2rtc version 1.9.14+dev.5ae8fad (5ae8fad) linux/amd64
 ```
 
-That is the **v59 derived-backoff-clear** build. The v60 source was archived on
-this branch, but v60 was not the live binary during this audit.
+That is the **v61 transient-settle and raw-preservation** build.
 
-Current source candidate: **v61 transient-settle and raw-preservation fix**.
+Current source candidate: **v62 shared recovery coordinator**.
 
-v61 is not deployed. It changes the v60 source in three conservative ways:
+v62 changes the v61 source in four focused ways:
 
-- Allows a derived stream up to three seconds of no counter movement during its
-  settle probe instead of failing after one 500 ms sample.
-- Rebases readiness checks when packet or byte counters restart, which indicates
-  a replacement producer generation.
-- Does not reset a raw Nest producer when its media counters are advancing or
-  have restarted with usable media.
+- Keeps one persistent recovery coordinator for each local Nest-derived stream.
+- Allows one producer dial/recovery owner while concurrent RTSP clients wait for
+  the same recovery result.
+- Parks recovery-time RTSP requests for at most 25 seconds, below Frigate's
+  current 30-second RTSP input timeout, instead of immediately returning a
+  local reset/404 response.
+- Rate-limits repeated recovery messages per event while preserving suppressed
+  event counts in the next emitted log.
 
-v61 also removes v60's unconditional early-publish reset. Live evidence showed
-that this broader reset could discard a raw Nest session that was still
-delivering media.
+The existing progressive media-probe backoff remains in force: repeated
+successful session generation with no packet flow escalates from 10 seconds to
+one, two, and five minutes. Verified packet flow plus H264 SPS, PPS, and a
+keyframe clears the recovery/backoff state immediately.
 
 Expected runtime version shape:
 
@@ -58,6 +60,8 @@ The version labels below are test-build labels for the B101 branch. They are not
 - `b101-v59-derived-backoff-clear`: clear stale Nest derived backoff after media recovery.
 - `b101-v60-derived-publish-reset`: archived experiment that force-resets the raw Nest upstream after early derived publish/media failures; do not deploy as the next candidate.
 - `b101-v61-transient-settle`: tolerate short settle pauses and preserve a raw producer that is still showing media activity.
+- `b101-v62-shared-recovery`: coordinate one recovery owner per local
+  Nest-derived stream and park concurrent RTSP requests for a bounded interval.
 
 ## Frigate 0.18.0 Beta2 Audit
 
@@ -136,6 +140,12 @@ For v11, the priority is stability over new behavior. The branch keeps the safer
 - Adds account-level `429 Too Many Requests` cooldown before more Google SDM commands are attempted.
 - Redacts sensitive Nest source URLs and private local stream names from reset/timeout logs.
 - Keeps repeated-failure recovery state during a short derived-stream publish probe, so a momentary local RTSP publish does not prematurely erase the outage history.
+- Coordinates local Nest-derived recovery per stream so concurrent RTSP clients
+  wait on one owner instead of starting overlapping producer recovery.
+- Parks local RTSP requests during recovery for a bounded interval below
+  Frigate's RTSP timeout, reducing rapid local `404` and ffmpeg restart loops.
+- Rate-limits identical recovery logs by stream and event while reporting how
+  many duplicates were suppressed.
 
 ## Removed From v11
 

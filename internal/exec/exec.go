@@ -84,6 +84,7 @@ const (
 	localNestProbeFailureWeight   = 2
 	localNestProbeHardResetAfter  = 2
 	localNestHandoffHold          = 2 * time.Minute
+	localNestRecoveryLogInterval  = 30 * time.Second
 )
 
 var errLocalNestUpstreamReset = errors.New("exec: local nest upstream reset")
@@ -105,6 +106,18 @@ var localNestRecovery = struct {
 	state map[string]localNestRecoveryState
 }{
 	state: map[string]localNestRecoveryState{},
+}
+
+type localNestRecoveryLogState struct {
+	last       time.Time
+	suppressed int
+}
+
+var localNestRecoveryLogs = struct {
+	sync.Mutex
+	state map[string]map[string]localNestRecoveryLogState
+}{
+	state: map[string]map[string]localNestRecoveryLogState{},
 }
 
 var localNestStartGates = struct {
@@ -351,10 +364,13 @@ func resetLocalNestInput(args []string, reason string) bool {
 	}
 
 	if wait := localNestRecoveryWait(name); wait > 0 {
-		log.Warn().
-			Str("reason", reason).
-			Stringer("wait", wait.Round(time.Millisecond)).
-			Msg("[exec] skip upstream nest reset during active recovery")
+		logLocalNestRecovery(name, "skip_reset", func(suppressed int) {
+			log.Warn().
+				Str("reason", reason).
+				Stringer("wait", wait.Round(time.Millisecond)).
+				Int("suppressed", suppressed).
+				Msg("[exec] skip upstream nest reset during active recovery")
+		})
 		return true
 	}
 
@@ -482,6 +498,37 @@ func localNestRecoveryWait(name string) time.Duration {
 		return wait
 	}
 	return 0
+}
+
+func allowLocalNestRecoveryLog(name, event string, now time.Time) (bool, int) {
+	localNestRecoveryLogs.Lock()
+	defer localNestRecoveryLogs.Unlock()
+
+	if localNestRecoveryLogs.state == nil {
+		localNestRecoveryLogs.state = map[string]map[string]localNestRecoveryLogState{}
+	}
+	events := localNestRecoveryLogs.state[name]
+	if events == nil {
+		events = map[string]localNestRecoveryLogState{}
+		localNestRecoveryLogs.state[name] = events
+	}
+	st := events[event]
+	if !st.last.IsZero() && now.Sub(st.last) < localNestRecoveryLogInterval {
+		st.suppressed++
+		events[event] = st
+		return false, 0
+	}
+	suppressed := st.suppressed
+	st.last = now
+	st.suppressed = 0
+	events[event] = st
+	return true, suppressed
+}
+
+func logLocalNestRecovery(name, event string, write func(int)) {
+	if allowed, suppressed := allowLocalNestRecoveryLog(name, event, time.Now()); allowed {
+		write(suppressed)
+	}
 }
 
 func markLocalNestPublishTimeout(name string, status streams.SourceSchemeStatus) (bool, int) {
@@ -639,10 +686,13 @@ func waitLocalNestRecovery(name string) error {
 	}
 
 	if publishWait, attempts := localNestPublishRecoveryWait(name); publishWait > 0 {
-		log.Warn().
-			Stringer("wait", publishWait.Round(time.Millisecond)).
-			Int("publish_timeouts", attempts).
-			Msg("[exec] keep local nest recovery for derived publish backoff")
+		logLocalNestRecovery(name, "publish_backoff", func(suppressed int) {
+			log.Warn().
+				Stringer("wait", publishWait.Round(time.Millisecond)).
+				Int("publish_timeouts", attempts).
+				Int("suppressed", suppressed).
+				Msg("[exec] keep local nest recovery for derived publish backoff")
+		})
 		return errLocalNestUpstreamReset
 	}
 
@@ -657,23 +707,32 @@ func waitLocalNestRecovery(name string) error {
 	}
 
 	if wait > localNestRecoveryStartWaitMax {
-		log.Warn().
-			Stringer("wait", wait.Round(time.Millisecond)).
-			Msg("[exec] local nest upstream still recovering")
+		logLocalNestRecovery(name, "recovery_hold", func(suppressed int) {
+			log.Warn().
+				Stringer("wait", wait.Round(time.Millisecond)).
+				Int("suppressed", suppressed).
+				Msg("[exec] local nest upstream still recovering")
+		})
 		return errLocalNestUpstreamReset
 	}
 
-	log.Warn().
-		Stringer("wait", wait.Round(time.Millisecond)).
-		Msg("[exec] waiting for local nest upstream recovery")
+	logLocalNestRecovery(name, "short_recovery_wait", func(suppressed int) {
+		log.Warn().
+			Stringer("wait", wait.Round(time.Millisecond)).
+			Int("suppressed", suppressed).
+			Msg("[exec] waiting for local nest upstream recovery")
+	})
 	timer := time.NewTimer(wait)
 	defer timer.Stop()
 	<-timer.C
 
 	if wait = localNestRecoveryWait(name); wait > 0 {
-		log.Warn().
-			Stringer("wait", wait.Round(time.Millisecond)).
-			Msg("[exec] local nest upstream still recovering")
+		logLocalNestRecovery(name, "recovery_hold", func(suppressed int) {
+			log.Warn().
+				Stringer("wait", wait.Round(time.Millisecond)).
+				Int("suppressed", suppressed).
+				Msg("[exec] local nest upstream still recovering")
+		})
 		return errLocalNestUpstreamReset
 	}
 	log.Info().Msg("[exec] local nest recovery wait complete")
