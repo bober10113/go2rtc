@@ -14,6 +14,7 @@ func (s *Stream) AddConsumer(cons core.Consumer) (err error) {
 	var prodErrors = make([]error, len(s.producers))
 	var prodMedias []*core.Media
 	var prodStarts []*Producer
+	var prodPrepared = make(map[*Producer]error)
 
 	// Step 1. Get consumer medias
 	consMedias := cons.GetMedias()
@@ -51,6 +52,9 @@ func (s *Stream) AddConsumer(cons core.Consumer) (err error) {
 				}
 
 				var track *core.Receiver
+				localNestH264Handoff := false
+				var localNestH264Ready <-chan struct{}
+				var localNestInputName string
 
 				switch prodMedia.Direction {
 				case core.DirectionRecvonly:
@@ -62,10 +66,43 @@ func (s *Stream) AddConsumer(cons core.Consumer) (err error) {
 						prodErrors[prodN] = err
 						continue
 					}
+
+					if inputName, ok := prod.localNestDerivedInput(); ok && core.GetKind(prodCodec.Name) == core.KindVideo {
+						localNestInputName = inputName
+						localNestH264Handoff = prodCodec.Name == core.CodecH264
+						if err, checked := prodPrepared[prod]; checked {
+							if err != nil {
+								prodErrors[prodN] = err
+								continue
+							}
+						} else {
+							prod.start()
+							err = prod.waitLocalNestDerivedWarmup()
+							prodPrepared[prod] = err
+							if err != nil {
+								prodErrors[prodN] = err
+								continue
+							}
+						}
+					}
+					if localNestH264Handoff {
+						track, localNestH264Ready = prod.localNestH264HandoffReceiver(track, prodCodec)
+					}
+
 					// Step 5. Add track to consumer
 					if err = cons.AddTrack(consMedia, consCodec, track); err != nil {
+						if localNestH264Handoff {
+							track.Close()
+						}
 						log.Info().Err(err).Msg("[streams] can't add track")
 						continue
+					}
+					if localNestH264Handoff {
+						if err = prod.waitLocalNestH264HandoffReady(localNestInputName, localNestH264Ready); err != nil {
+							track.Close()
+							prodErrors[prodN] = err
+							continue
+						}
 					}
 
 				case core.DirectionSendonly:
@@ -107,8 +144,20 @@ func (s *Stream) AddConsumer(cons core.Consumer) (err error) {
 	s.mu.Unlock()
 
 	// there may be duplicates, but that's not a problem
+	started := make(map[*Producer]struct{}, len(prodStarts))
 	for _, prod := range prodStarts {
+		if _, ok := started[prod]; ok {
+			continue
+		}
+		started[prod] = struct{}{}
 		prod.start()
+	}
+
+	for prod := range started {
+		if err = prod.waitLocalNestDerivedWarmup(); err != nil {
+			s.RemoveConsumer(cons)
+			return err
+		}
 	}
 
 	return nil

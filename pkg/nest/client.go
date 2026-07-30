@@ -78,6 +78,13 @@ func (c *WebRTCClient) GetTrack(media *core.Media, codec *core.Codec) (*core.Rec
 	return c.conn.GetTrack(media, codec)
 }
 
+func (c *WebRTCClient) SourceReceivers() []*core.Receiver {
+	if c == nil || c.conn == nil {
+		return nil
+	}
+	return c.conn.Receivers
+}
+
 func (c *WebRTCClient) AddTrack(media *core.Media, codec *core.Codec, track *core.Receiver) error {
 	return c.conn.AddTrack(media, codec, track)
 }
@@ -179,6 +186,13 @@ func (c *RTSPClient) GetMedias() []*core.Media {
 
 func (c *RTSPClient) GetTrack(media *core.Media, codec *core.Codec) (*core.Receiver, error) {
 	return c.conn.GetTrack(media, codec)
+}
+
+func (c *RTSPClient) SourceReceivers() []*core.Receiver {
+	if c == nil || c.conn == nil {
+		return nil
+	}
+	return c.conn.Receivers
 }
 
 func (c *RTSPClient) Start() error {

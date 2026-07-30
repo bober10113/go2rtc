@@ -87,15 +87,8 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 			}
 		}
 
-		if c.Mode == core.ModePassiveProducer && remote.Kind() == webrtc.RTPCodecTypeVideo {
-			go func() {
-				pkts := []rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: uint32(remote.SSRC())}}
-				for range time.NewTicker(time.Second * 2).C {
-					if err := pc.WriteRTCP(pkts); err != nil {
-						return
-					}
-				}
-			}()
+		if shouldRequestKeyframes(c, remote) {
+			go requestKeyframes(pc, remote, c.FormatName == "nest/webrtc")
 		}
 
 		for {
@@ -145,6 +138,39 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 	})
 
 	return c
+}
+
+func requestKeyframes(pc *webrtc.PeerConnection, remote *webrtc.TrackRemote, burst bool) {
+	pkts := []rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: uint32(remote.SSRC())}}
+
+	if burst {
+		for i := 0; i < 12; i++ {
+			if err := pc.WriteRTCP(pkts); err != nil {
+				return
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+	}
+
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		if err := pc.WriteRTCP(pkts); err != nil {
+			return
+		}
+		<-ticker.C
+	}
+}
+
+func shouldRequestKeyframes(c *Conn, remote *webrtc.TrackRemote) bool {
+	if remote.Kind() != webrtc.RTPCodecTypeVideo {
+		return false
+	}
+
+	// Nest WebRTC is an active producer; prompt keyframes after reconnects so
+	// downstream RTSP/ffmpeg consumers do not start from a headerless H264 flow.
+	return c.Mode == core.ModePassiveProducer || c.FormatName == "nest/webrtc"
 }
 
 func (c *Conn) MarshalJSON() ([]byte, error) {

@@ -8,10 +8,8 @@ import (
 func (c *Conn) GetTrack(media *core.Media, codec *core.Codec) (*core.Receiver, error) {
 	core.Assert(media.Direction == core.DirectionRecvonly)
 
-	for _, track := range c.Receivers {
-		if track.Codec == codec {
-			return track, nil
-		}
+	if track := c.getReceiverTrack(media, codec); track != nil {
+		return track, nil
 	}
 
 	switch c.Mode {
@@ -41,6 +39,38 @@ func (c *Conn) GetTrack(media *core.Media, codec *core.Codec) (*core.Receiver, e
 	track := core.NewReceiver(media, codec)
 	c.Receivers = append(c.Receivers, track)
 	return track, nil
+}
+
+func (c *Conn) getReceiverTrack(media *core.Media, codec *core.Codec) *core.Receiver {
+	var compatible *core.Receiver
+
+	for _, track := range c.Receivers {
+		if track.Codec == codec {
+			return track
+		}
+
+		if track.Codec == nil || !track.Codec.Match(codec) {
+			continue
+		}
+
+		if track.Media == nil || !track.Media.Equal(media) {
+			continue
+		}
+
+		// After a Nest/WebRTC reconnect, the remote track can carry the same
+		// H264 media through a new codec pointer. Prefer the receiver that is
+		// already getting packets so RTSP/ffmpeg consumers don't stay attached
+		// to a stale, headerless receiver.
+		if track.Packets > 0 {
+			return track
+		}
+
+		if compatible == nil {
+			compatible = track
+		}
+	}
+
+	return compatible
 }
 
 func (c *Conn) Start() error {
