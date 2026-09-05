@@ -15,6 +15,7 @@ func (s *Stream) AddConsumer(cons core.Consumer) (err error) {
 	var prodMedias []*core.Media
 	var prodStarts []*Producer
 	var prodPrepared = make(map[*Producer]error)
+	var prodVideoReady = make(map[*Producer]bool)
 
 	// Step 1. Get consumer medias
 	consMedias := cons.GetMedias()
@@ -104,6 +105,9 @@ func (s *Stream) AddConsumer(cons core.Consumer) (err error) {
 							continue
 						}
 					}
+					if localNestInputName != "" {
+						prodVideoReady[prod] = true
+					}
 
 				case core.DirectionSendonly:
 					log.Trace().Msgf("[streams] match cons=%d => prod=%d", consN, prodN)
@@ -154,6 +158,11 @@ func (s *Stream) AddConsumer(cons core.Consumer) (err error) {
 	}
 
 	for prod := range started {
+		// Video was warmed before AddTrack and H264 handoff. Do not repeat that
+		// wait after the consumer has already received its first usable keyframe.
+		if prodVideoReady[prod] {
+			continue
+		}
 		if err = prod.waitLocalNestDerivedWarmup(); err != nil {
 			s.RemoveConsumer(cons)
 			return err

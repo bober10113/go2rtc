@@ -12,24 +12,28 @@ This document intentionally avoids private camera names, device names, tokens, U
 
 ## Current Live and Candidate State
 
-Current live Frigate binary before the 2026-07-30 v62 deployment:
+Live Frigate binary verified on 2026-09-05 (Frigate 0.18.0-rc1):
 
 ```text
-go2rtc version 1.9.14+dev.5ae8fad (5ae8fad) linux/amd64
+go2rtc version 1.9.14+dev.222d37f (222d37f) linux/amd64
 ```
 
-That is the **v61 transient-settle and raw-preservation** build.
+That is **v62 shared recovery coordinator**. Startup health did not prove
+recording continuity: the latest audit found substantial Nest recording gaps.
 
-Current source candidate: **v62 shared recovery coordinator**.
+Current source candidate: **v63 recovery follow-up**, not deployed.
+See [v63 evidence, scope, and validation](B101_V63_RECOVERY_FOLLOWUP.md).
+
+### v62 Background
 
 v62 changes the v61 source in four focused ways:
 
 - Keeps one persistent recovery coordinator for each local Nest-derived stream.
 - Allows one producer dial/recovery owner while concurrent RTSP clients wait for
   the same recovery result.
-- Parks recovery-time RTSP requests for at most 25 seconds, below Frigate's
-  current 30-second RTSP input timeout, instead of immediately returning a
-  local reset/404 response.
+- Parks concurrent recovery waiters for 25 seconds. This is not an end-to-end
+  bound for the owner that performs the synchronous producer dial. The audit
+  also showed Frigate's no-frame watchdog expiring after 20 seconds.
 - Rate-limits repeated recovery messages per event while preserving suppressed
   event counts in the next emitted log.
 
@@ -62,6 +66,9 @@ The version labels below are test-build labels for the B101 branch. They are not
 - `b101-v61-transient-settle`: tolerate short settle pauses and preserve a raw producer that is still showing media activity.
 - `b101-v62-shared-recovery`: coordinate one recovery owner per local
   Nest-derived stream and park concurrent RTSP requests for a bounded interval.
+- `b101-v63-recovery-followup`: separate publish monitoring from cooldown,
+  reject obsolete probe callbacks, avoid duplicate video warm-up, clean failed
+  WebRTC peers, bound command admission, and diagnose API failures safely.
 
 ## Frigate 0.18.0 Beta2 Audit
 

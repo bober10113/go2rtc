@@ -126,24 +126,12 @@ func rtcConn(nestAPI *API, rawURL, projectID, deviceID string) (*WebRTCClient, e
 		conn.Protocol = "http"
 		conn.URL = rawURL
 
-		// https://developers.google.com/nest/device-access/traits/device/camera-live-stream#generatewebrtcstream-request-fields
-		medias := []*core.Media{
-			{Kind: core.KindAudio, Direction: core.DirectionRecvonly},
-			{Kind: core.KindVideo, Direction: core.DirectionRecvonly},
-			{Kind: "app"}, // important for Nest
-		}
-
-		// 3. Create offer with candidates
-		offer, err := conn.CreateCompleteOffer(medias)
-		if err != nil {
-			return nil, err
-		}
-
-		// 4. Exchange SDP via Hass
-		answer, err := nestAPI.ExchangeSDP(projectID, deviceID, offer)
+		exchangeFailed, err := negotiateRTC(conn, func(offer string) (string, error) {
+			return nestAPI.ExchangeSDP(projectID, deviceID, offer)
+		})
 		if err != nil {
 			lastErr = err
-			if attempt < maxRetries-1 {
+			if exchangeFailed && attempt < maxRetries-1 {
 				time.Sleep(retryDelay)
 				retryDelay *= 2
 				continue
@@ -151,15 +139,34 @@ func rtcConn(nestAPI *API, rawURL, projectID, deviceID string) (*WebRTCClient, e
 			return nil, err
 		}
 
-		// 5. Set answer with remote medias
-		if err = conn.SetAnswer(answer); err != nil {
-			return nil, err
-		}
-
 		return &WebRTCClient{conn: conn, api: nestAPI}, nil
 	}
 
 	return nil, lastErr
+}
+
+func negotiateRTC(conn *webrtc.Conn, exchange func(string) (string, error)) (exchangeFailed bool, err error) {
+	// Every failed attempt owns a peer and ICE sockets, even before Start runs.
+	defer func() {
+		if err != nil {
+			_ = conn.Close()
+		}
+	}()
+
+	medias := []*core.Media{
+		{Kind: core.KindAudio, Direction: core.DirectionRecvonly},
+		{Kind: core.KindVideo, Direction: core.DirectionRecvonly},
+		{Kind: "app"}, // Required by Nest, after audio and video.
+	}
+	offer, err := conn.CreateCompleteOffer(medias)
+	if err != nil {
+		return false, err
+	}
+	answer, err := exchange(offer)
+	if err != nil {
+		return true, err
+	}
+	return false, conn.SetAnswer(answer)
 }
 
 func rtspConn(nestAPI *API, rawURL, projectID, deviceID string) (*RTSPClient, error) {

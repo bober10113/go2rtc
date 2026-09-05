@@ -2,8 +2,10 @@ package nest
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -72,9 +74,16 @@ type DeviceInfo struct {
 var cache = map[string]*API{}
 var cacheMu sync.Mutex
 
-// commandMu serializes Google SDM executeCommand calls.
+// commandGate serializes Google SDM executeCommand calls.
 // This avoids several Nest cameras generating/extending/stopping at the same instant.
-var commandMu sync.Mutex
+var commandGate = make(chan struct{}, 1)
+
+// Nest transport recovery must not close idle connections used by other sources.
+var nestHTTPTransport = http.DefaultTransport.(*http.Transport).Clone()
+
+func newNestHTTPClient(timeout time.Duration) *http.Client {
+	return &http.Client{Transport: nestHTTPTransport, Timeout: timeout}
+}
 
 var rateLimitState = struct {
 	sync.Mutex
@@ -121,18 +130,61 @@ type nestStatusError struct {
 	Command    string
 	StatusCode int
 	Status     string
+	RPCStatus  string
+	Reason     string
 }
 
 func (e *nestStatusError) Error() string {
-	return "nest: wrong status: " + e.Status
+	text := "nest: wrong status: " + e.Status
+	if e.RPCStatus != "" {
+		text += " rpc=" + e.RPCStatus
+	}
+	if e.Reason != "" {
+		text += " reason=" + e.Reason
+	}
+	return text
 }
 
 func newNestStatusError(command string, res *http.Response) error {
-	return &nestStatusError{
+	err := &nestStatusError{
 		Command:    command,
 		StatusCode: res.StatusCode,
 		Status:     res.Status,
 	}
+	if res.Body == nil {
+		return err
+	}
+	const maxErrorBody = 16 * 1024
+	body, readErr := io.ReadAll(io.LimitReader(res.Body, maxErrorBody+1))
+	if readErr != nil || len(body) > maxErrorBody {
+		return err
+	}
+	var envelope struct {
+		Error struct {
+			Status  string `json:"status"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &envelope) != nil {
+		return err
+	}
+	// Do not log arbitrary API text: it can contain device IDs, SDP or tokens.
+	switch envelope.Error.Status {
+	case "CANCELLED", "UNKNOWN", "INVALID_ARGUMENT", "DEADLINE_EXCEEDED",
+		"NOT_FOUND", "ALREADY_EXISTS", "PERMISSION_DENIED", "RESOURCE_EXHAUSTED",
+		"FAILED_PRECONDITION", "ABORTED", "OUT_OF_RANGE", "UNIMPLEMENTED",
+		"INTERNAL", "UNAVAILABLE", "DATA_LOSS", "UNAUTHENTICATED":
+		err.RPCStatus = envelope.Error.Status
+	}
+	switch envelope.Error.Message {
+	case "The camera is not available for streaming.":
+		err.Reason = "camera_unavailable"
+	case "Command is not supported for doorbell.":
+		err.Reason = "unsupported_doorbell_command"
+	case "Permission denied.":
+		err.Reason = "permission_denied"
+	}
+	return err
 }
 
 func nestStatusCode(err error) int {
@@ -172,16 +224,31 @@ func nestDeviceSuffix(deviceID string) string {
 
 func doNestRequest(client *http.Client, req *http.Request, command, deviceID string, attempt int) (*http.Response, error) {
 	lockStart := time.Now()
-	commandMu.Lock()
+	queueTimeout := client.Timeout
+	if queueTimeout <= 0 {
+		queueTimeout = nestCommandTimeout
+	}
+	queueCtx, cancel := context.WithTimeout(req.Context(), queueTimeout)
+	defer cancel()
+	select {
+	case commandGate <- struct{}{}:
+		defer func() { <-commandGate }()
+	case <-queueCtx.Done():
+		nestLogf("command queue expired command=%s device=%s attempt=%d wait=%s", command, nestDeviceSuffix(deviceID), attempt, time.Since(lockStart).Round(time.Millisecond))
+		return nil, queueCtx.Err()
+	}
+	if err := queueCtx.Err(); err != nil {
+		return nil, err
+	}
 	waitForNestRateLimit(command, deviceID)
 	lockWait := time.Since(lockStart)
-	defer commandMu.Unlock()
 
 	started := time.Now()
 	nestLogf("command start command=%s device=%s attempt=%d lock_wait=%s", command, nestDeviceSuffix(deviceID), attempt, lockWait.Round(time.Millisecond))
 	res, err := client.Do(req)
 	duration := time.Since(started)
 	if err != nil {
+		client.CloseIdleConnections()
 		nestLogf("command error command=%s device=%s attempt=%d duration=%s error=%v", command, nestDeviceSuffix(deviceID), attempt, duration.Round(time.Millisecond), err)
 		return nil, err
 	}
@@ -405,7 +472,7 @@ func NewAPI(clientID, clientSecret, refreshToken string) (*API, error) {
 		"refresh_token": []string{refreshToken},
 	}
 
-	client := &http.Client{Timeout: nestOAuthTimeout}
+	client := newNestHTTPClient(nestOAuthTimeout)
 	res, err := client.PostForm("https://www.googleapis.com/oauth2/v4/token", data)
 	if err != nil {
 		return nil, err
@@ -449,7 +516,7 @@ func (a *API) GetDevices(projectID string) ([]DeviceInfo, error) {
 
 	req.Header.Set("Authorization", "Bearer "+a.Token)
 
-	client := &http.Client{Timeout: nestGetDevicesTimeout}
+	client := newNestHTTPClient(nestGetDevicesTimeout)
 	res, err := doNestRequest(client, req, "GetDevices", "", 1)
 	if err != nil {
 		return nil, err
@@ -530,7 +597,7 @@ func (a *API) ExchangeSDP(projectID, deviceID, offer string) (string, error) {
 
 		req.Header.Set("Authorization", "Bearer "+a.Token)
 
-		client := &http.Client{Timeout: nestCommandTimeout}
+		client := newNestHTTPClient(nestCommandTimeout)
 		res, err := doNestRequest(client, req, command, deviceID, attempt)
 		if err != nil {
 			if attempt < maxRetries {
@@ -554,6 +621,7 @@ func (a *API) ExchangeSDP(projectID, deviceID, offer string) (string, error) {
 				a.sleepAfterFailure(command, err, time.Second)
 				continue
 			}
+			return "", err
 		case http.StatusConflict, http.StatusTooManyRequests:
 			err := newNestStatusError(command, res)
 			res.Body.Close()
@@ -562,6 +630,7 @@ func (a *API) ExchangeSDP(projectID, deviceID, offer string) (string, error) {
 				retryDelay *= 2
 				continue
 			}
+			return "", err
 		}
 
 		if res.StatusCode != http.StatusOK {
@@ -658,7 +727,7 @@ func (a *API) ExtendStream() error {
 
 		req.Header.Set("Authorization", "Bearer "+a.Token)
 
-		client := &http.Client{Timeout: nestCommandTimeout}
+		client := newNestHTTPClient(nestCommandTimeout)
 		res, err := doNestRequest(client, req, command, a.StreamDeviceID, attempt)
 		if err != nil {
 			if attempt < maxRetries {
@@ -682,6 +751,7 @@ func (a *API) ExtendStream() error {
 				a.sleepAfterFailure(command, err, time.Second)
 				continue
 			}
+			return err
 		case http.StatusConflict, http.StatusTooManyRequests:
 			err := newNestStatusError(command, res)
 			res.Body.Close()
@@ -690,6 +760,7 @@ func (a *API) ExtendStream() error {
 				retryDelay *= 2
 				continue
 			}
+			return err
 		}
 
 		if res.StatusCode != http.StatusOK {
@@ -748,7 +819,7 @@ func (a *API) GenerateRtspStream(projectID, deviceID string) (string, error) {
 
 	req.Header.Set("Authorization", "Bearer "+a.Token)
 
-	client := &http.Client{Timeout: nestCommandTimeout}
+	client := newNestHTTPClient(nestCommandTimeout)
 	res, err := doNestRequest(client, req, command, deviceID, 1)
 	if err != nil {
 		return "", err
@@ -816,7 +887,7 @@ func (a *API) StopRTSPStream() error {
 
 	req.Header.Set("Authorization", "Bearer "+a.Token)
 
-	client := &http.Client{Timeout: nestStopTimeout}
+	client := newNestHTTPClient(nestStopTimeout)
 	res, err := doNestRequest(client, req, command, a.StreamDeviceID, 1)
 	if err != nil {
 		return err

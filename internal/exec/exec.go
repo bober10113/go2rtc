@@ -92,6 +92,7 @@ var errLocalNestMediaTimeout = errors.New("exec: local nest upstream media timeo
 
 type localNestRecoveryState struct {
 	until              time.Time
+	probeUntil         time.Time
 	failures           int
 	probeFailures      int
 	lastFailure        time.Time
@@ -103,7 +104,8 @@ type localNestRecoveryState struct {
 
 var localNestRecovery = struct {
 	sync.Mutex
-	state map[string]localNestRecoveryState
+	state         map[string]localNestRecoveryState
+	nextPublishID uint64
 }{
 	state: map[string]localNestRecoveryState{},
 }
@@ -436,6 +438,8 @@ func markLocalNestRecovery(name string, reason string, inactive bool) time.Durat
 	st.failures++
 	st.lastFailure = now
 	st.packets = status.Packets
+	st.publishID = 0
+	st.probeUntil = time.Time{}
 
 	wait := localNestRecoveryWindow(st.failures, st.probeFailures, inactive)
 	st.until = now.Add(wait)
@@ -542,6 +546,8 @@ func markLocalNestPublishTimeout(name string, status streams.SourceSchemeStatus)
 	st.publishTimeouts++
 	st.lastPublishTimeout = now
 	st.lastFailure = now
+	st.publishID = 0
+	st.probeUntil = time.Time{}
 
 	attempts := st.publishTimeouts
 	// If the derived ffmpeg publisher cannot ANNOUNCE within the start timeout,
@@ -766,12 +772,14 @@ func markLocalNestPublished(name string, reason string) {
 	}
 
 	mediaReady := localNestMediaReadyForRecovery(status, st.packets)
-	if st.publishID != 0 && now.Before(st.until) {
+	if st.publishID != 0 && now.Before(st.probeUntil) {
 		st.failures += localNestProbeFailureWeight
 		st.probeFailures++
 		st.lastFailure = now
 		wait := localNestRecoveryWindow(st.failures, st.probeFailures, !mediaReady)
 		st.until = now.Add(wait)
+		st.publishID = 0
+		st.probeUntil = time.Time{}
 		hardReset := st.probeFailures >= localNestProbeHardResetAfter
 		localNestRecovery.state[name] = st
 		localNestRecovery.Unlock()
@@ -801,11 +809,15 @@ func markLocalNestPublished(name string, reason string) {
 		return
 	}
 
-	st.publishID++
+	// Probe callbacks must not match a later recovery after the state was cleared.
+	localNestRecovery.nextPublishID++
+	st.publishID = localNestRecovery.nextPublishID
 	publishID := st.publishID
 	startPackets := st.packets
 	st.packets = status.Packets
-	st.until = now.Add(localNestStablePublishWindow)
+	// Observe the new publisher without treating observation as a retry cooldown.
+	st.until = time.Time{}
+	st.probeUntil = now.Add(localNestStablePublishWindow)
 	localNestRecovery.state[name] = st
 	localNestRecovery.Unlock()
 

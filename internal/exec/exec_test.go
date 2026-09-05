@@ -139,3 +139,98 @@ func TestLocalNestPublishTimeoutResetsWhenRawPacketsContinue(t *testing.T) {
 		t.Fatalf("second attempts = %d, want 2", attempts)
 	}
 }
+
+func TestLocalNestPublishProbeDoesNotRearmExpiredPublishBackoff(t *testing.T) {
+	const name = "test_expired_publish_backoff"
+	defer clearLocalNestRecovery(name)
+	localNestRecovery.Lock()
+	localNestRecovery.state[name] = localNestRecoveryState{
+		until: time.Now().Add(-time.Second), publishTimeouts: 1,
+		lastPublishTimeout: time.Now().Add(-time.Minute),
+	}
+	localNestRecovery.Unlock()
+
+	markLocalNestPublished(name, "test published")
+	if wait, _ := localNestPublishRecoveryWait(name); wait > 0 {
+		t.Fatalf("successful publication rearmed publish backoff for %s", wait)
+	}
+	if wait := localNestRecoveryWait(name); wait > 0 {
+		t.Fatalf("observation probe blocked a new connection for %s", wait)
+	}
+}
+
+func TestLocalNestOldProbeCannotModifyNewRecovery(t *testing.T) {
+	const name = "test_probe_generation"
+	defer clearLocalNestRecovery(name)
+	begin := func() uint64 {
+		localNestRecovery.Lock()
+		localNestRecovery.state[name] = localNestRecoveryState{}
+		localNestRecovery.Unlock()
+		markLocalNestPublished(name, "test published")
+		localNestRecovery.Lock()
+		defer localNestRecovery.Unlock()
+		return localNestRecovery.state[name].publishID
+	}
+	oldID := begin()
+	clearLocalNestRecovery(name)
+	newID := begin()
+	if oldID == newID {
+		t.Fatal("reused probe ID after recovery state was cleared")
+	}
+	completeLocalNestPublishProbe(name, "late test callback", oldID)
+	localNestRecovery.Lock()
+	st := localNestRecovery.state[name]
+	localNestRecovery.Unlock()
+	if st.publishID != newID || st.failures != 0 || st.probeFailures != 0 || !st.until.IsZero() {
+		t.Fatalf("old probe changed current recovery: %+v", st)
+	}
+}
+
+func TestLocalNestFailedProbeStillBacksOff(t *testing.T) {
+	const name = "test_failed_publish_probe"
+	defer clearLocalNestRecovery(name)
+	localNestRecovery.Lock()
+	localNestRecovery.state[name] = localNestRecoveryState{}
+	localNestRecovery.Unlock()
+	markLocalNestPublished(name, "test published")
+	localNestRecovery.Lock()
+	id := localNestRecovery.state[name].publishID
+	localNestRecovery.Unlock()
+	// No registered raw source: a completed probe cannot be considered healthy.
+	completeLocalNestPublishProbe(name, "test no media", id)
+	if wait := localNestRecoveryWait(name); wait <= 0 {
+		t.Fatal("failed probe did not back off")
+	}
+}
+
+func TestLocalNestNewFailureInvalidatesOutstandingProbe(t *testing.T) {
+	for _, publishTimeout := range []bool{false, true} {
+		name := "test_new_failure"
+		if publishTimeout {
+			name += "_timeout"
+		}
+		localNestRecovery.Lock()
+		localNestRecovery.state[name] = localNestRecoveryState{}
+		localNestRecovery.Unlock()
+		markLocalNestPublished(name, "test published")
+		localNestRecovery.Lock()
+		id := localNestRecovery.state[name].publishID
+		localNestRecovery.Unlock()
+		if publishTimeout {
+			markLocalNestPublishTimeout(name, streams.SourceSchemeStatus{})
+		} else {
+			markLocalNestRecovery(name, "test failure", true)
+		}
+		localNestRecovery.Lock()
+		before := localNestRecovery.state[name]
+		localNestRecovery.Unlock()
+		completeLocalNestPublishProbe(name, "late test callback", id)
+		localNestRecovery.Lock()
+		after := localNestRecovery.state[name]
+		localNestRecovery.Unlock()
+		clearLocalNestRecovery(name)
+		if before != after || after.publishID != 0 || !after.probeUntil.IsZero() {
+			t.Fatalf("late callback counted a second failure: before=%+v after=%+v", before, after)
+		}
+	}
+}
