@@ -15,13 +15,15 @@ This document intentionally avoids private camera names, device names, tokens, U
 Live Frigate binary verified on 2026-09-05 (Frigate 0.18.0-rc1):
 
 ```text
-go2rtc version 1.9.14+dev.222d37f (222d37f) linux/amd64
+go2rtc version 1.9.14+dev.f9aea2a (f9aea2a) linux/amd64
 ```
 
-That is **v62 shared recovery coordinator**. Startup health did not prove
-recording continuity: the latest audit found substantial Nest recording gaps.
+That is **v63 recovery follow-up**, deployed with approval on 2026-09-05.
+Frigate restarted at 15:32:00 EDT. The first check confirmed fresh recordings
+from all eight cameras, with no startup ffmpeg crashes or no-frame errors.
+This verifies startup only; longer observation is still required.
 
-Current source candidate: **v63 recovery follow-up**, not deployed.
+The pre-deployment v62 audit found substantial Nest recording gaps.
 See [v63 evidence, scope, and validation](B101_V63_RECOVERY_FOLLOWUP.md).
 
 ### v62 Background

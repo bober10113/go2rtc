@@ -1,9 +1,26 @@
 # v63 Recovery Follow-Up Candidate
 
-Status: candidate, not deployed. Base: v62, commit `222d37f`.
+Status: deployed with approval on 2026-09-05 at 15:32:00 EDT.
+Runtime source commit: `f9aea2a`. Base: v62, commit `222d37f`.
 The live Frigate image remains 0.18.0-rc1. No compose, camera configuration,
 FFmpeg settings, recording retention, audio conversion, or production binary
 was changed during this audit.
+
+## Deployment Verification
+
+The subsequent approved deployment replaced only the custom binary, after
+verified binary/configuration/Compose backups. Their non-binary checksums
+were unchanged after restart. Runtime verification showed one go2rtc process
+and version `1.9.14+dev.f9aea2a` with SHA-256
+`93a86cea2d5cc6364cbc7d03db2e75bfa94e21bec4494ff85493d0ba17f1ede5`.
+
+At 15:33:43 EDT, all eight enabled cameras had multiple new finalized
+recordings. The three Nest cameras began recording 20-23 seconds after
+container startup and were receiving approximately 5 FPS. Probing a recent
+recording from each Nest camera confirmed 1600x1200 H264 video and AAC audio.
+The initial log check found no ffmpeg crashes, no-frame events, invalid-data
+errors, or Google 400/429 responses. This is startup verification, not proof
+that long-running recovery problems have been eliminated.
 
 ## Evidence
 
@@ -82,7 +99,7 @@ errors. A bare HTTP 400 cannot identify that condition. See the
 - The synchronous dial owner and idle-producer handoff still warrant separate
   investigation. The duplicate-warm-up correction reduces local delay, but
   does not replace these paths with a fully asynchronous state machine.
-- Deployment requires a production backup and separate approval. Judge a
+- Future redeployment requires a production backup and separate approval. Judge a
   later trial by finalized recording gaps and the time from first fresh media
   to resumed recording, not by green startup status. Preserve v62 for rollback.
 - During a trial, verify repeated failures still back off, no stale callback
