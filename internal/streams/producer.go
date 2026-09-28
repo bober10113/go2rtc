@@ -92,6 +92,8 @@ const (
 	execNestDerivedSettleStallGrace = 3 * time.Second
 	execNestDerivedDescribeWait     = 25 * time.Second
 	execNestRecoveryLogInterval     = 30 * time.Second
+	execNestDerivedEscalateAfter    = time.Minute
+	execNestDerivedResetInterval    = 2 * time.Minute
 )
 
 type SourceSchemeStatus struct {
@@ -135,11 +137,15 @@ type execNestDerivedRecoveryCall struct {
 }
 
 type execNestDerivedRecoveryState struct {
-	call       *execNestDerivedRecoveryCall
-	changed    chan struct{}
-	parked     int
-	lastLogs   map[string]time.Time
-	suppressed map[string]int
+	call           *execNestDerivedRecoveryCall
+	changed        chan struct{}
+	parked         int
+	lastLogs       map[string]time.Time
+	suppressed     map[string]int
+	failedSince    time.Time
+	lastFailure    time.Time
+	failedAttempts int
+	lastRawReset   time.Time
 }
 
 var execNestDerivedRecovery = struct {
@@ -582,6 +588,7 @@ func (p *Producer) waitLocalNestDerivedWarmupOwner(inputName string) error {
 
 	severity := execNestDerivedWarmupSeverity(failures, recentStarts)
 	timeout, stableFor, minPackets := execNestDerivedWarmupPolicy(severity)
+	timeout = execNestDerivedRecoveryTimeout(inputName, now, timeout)
 	settleFor := execNestDerivedSettleDelay(severity)
 	endRecoveryHold := p.beginLocalNestDerivedRecoveryHold(timeout + settleFor + deferredStopPadding)
 	defer endRecoveryHold()
@@ -632,7 +639,7 @@ func (p *Producer) waitLocalNestDerivedWarmupOwner(inputName string) error {
 			startBytes = status.Bytes
 			readySince = time.Time{}
 			readyPackets = 0
-			resetDurationTimer(deadline, timeout)
+			resetDurationTimer(deadline, execNestDerivedRecoveryTimeout(inputName, time.Now(), timeout))
 		}
 		if status.Ready() && packets >= startPackets+minPackets && status.Bytes > startBytes {
 			if readySince.IsZero() {
@@ -681,7 +688,7 @@ func (p *Producer) waitLocalNestDerivedWarmupOwner(inputName string) error {
 			failures := p.execNestFailures
 			p.mu.Unlock()
 
-			resetRaw := execNestShouldResetRawAfterDerivedFailure(failures, rawActivity)
+			resetRaw, escalated := reserveExecNestDerivedRawReset(inputName, failures, rawActivity, false, time.Now())
 			handled, changed, inactive := false, false, false
 			if resetRaw {
 				handled, changed, inactive = ResetIfSourceSchemeDetailed(inputName, "nest", "derived media timeout")
@@ -704,6 +711,7 @@ func (p *Producer) waitLocalNestDerivedWarmupOwner(inputName string) error {
 				Bool("raw_available", rawOK).
 				Bool("raw_activity", rawActivity).
 				Bool("reset_raw", resetRaw).
+				Bool("raw_activity_escalation", escalated).
 				Bool("raw_handled", handled).
 				Bool("raw_changed", changed).
 				Bool("raw_inactive", inactive).
@@ -827,7 +835,7 @@ func (p *Producer) failLocalNestDerivedSettle(inputName string, startPackets, st
 	failures := p.execNestFailures
 	p.mu.Unlock()
 
-	resetRaw := execNestShouldResetRawAfterDerivedSettleFailure(failures, rawActivity)
+	resetRaw, escalated := reserveExecNestDerivedRawReset(inputName, failures, rawActivity, true, time.Now())
 	handled, changed, inactive := false, false, false
 	if resetRaw {
 		handled, changed, inactive = ResetIfSourceSchemeDetailed(inputName, "nest", "derived media settle failed")
@@ -851,6 +859,7 @@ func (p *Producer) failLocalNestDerivedSettle(inputName string, startPackets, st
 		Bool("raw_available", rawOK).
 		Bool("raw_activity", rawActivity).
 		Bool("reset_raw", resetRaw).
+		Bool("raw_activity_escalation", escalated).
 		Bool("raw_handled", handled).
 		Bool("raw_changed", changed).
 		Bool("raw_inactive", inactive)
@@ -1324,6 +1333,82 @@ func execNestShouldResetRawAfterDerivedSettleFailure(failures int, rawActivity b
 	return failures >= execNestDerivedSettleResetAfter && !rawActivity
 }
 
+// Raw packets are not proof of usable derived video. Escalate only repeated
+// failed media gates, sharing the reservation across consumers of this source.
+func reserveExecNestDerivedRawReset(inputName string, failures int, rawActivity, settle bool, now time.Time) (reset, escalated bool) {
+	execNestDerivedRecovery.Lock()
+	defer execNestDerivedRecovery.Unlock()
+	state := execNestDerivedRecoveryStateLocked(inputName)
+	noteExecNestDerivedFailureLocked(state, now, now)
+
+	reset = execNestShouldResetRawAfterDerivedFailure(failures, rawActivity)
+	if settle {
+		reset = execNestShouldResetRawAfterDerivedSettleFailure(failures, rawActivity)
+	}
+	escalated = rawActivity && state.failedAttempts >= 2 &&
+		now.Sub(state.failedSince) >= execNestDerivedEscalateAfter
+	if !reset && !escalated {
+		return false, false
+	}
+	// An inactive source keeps its existing reset policy and producer-level
+	// duplicate guard. The new cooldown only limits active-raw escalation.
+	if escalated && !state.lastRawReset.IsZero() && now.Sub(state.lastRawReset) < execNestDerivedResetInterval {
+		return false, false
+	}
+	state.lastRawReset = now
+	state.failedSince = now
+	state.failedAttempts = 0
+	return true, escalated
+}
+
+func noteExecNestDerivedFailureLocked(state *execNestDerivedRecoveryState, now, since time.Time) {
+	if state.lastFailure.IsZero() || now.Sub(state.lastFailure) > execNestBackoffWindow {
+		state.failedSince = since
+		state.failedAttempts = 0
+	}
+	state.lastFailure = now
+	state.failedAttempts++
+}
+
+func noteExecNestDerivedStall(inputName string, now time.Time, stagnantFor time.Duration) {
+	execNestDerivedRecovery.Lock()
+	defer execNestDerivedRecovery.Unlock()
+	noteExecNestDerivedFailureLocked(execNestDerivedRecoveryStateLocked(inputName), now, now.Add(-stagnantFor))
+}
+
+// Do not wait for another full warmup after sustained failed recovery. This
+// shortens only an existing media probe; it never extends a retry or API hold.
+func execNestDerivedRecoveryTimeout(inputName string, now time.Time, timeout time.Duration) time.Duration {
+	execNestDerivedRecovery.Lock()
+	defer execNestDerivedRecovery.Unlock()
+	state := execNestDerivedRecoveryStateLocked(inputName)
+	if state.lastFailure.IsZero() || now.Sub(state.lastFailure) > execNestBackoffWindow || state.failedAttempts == 0 {
+		return timeout
+	}
+	deadline := state.failedSince.Add(execNestDerivedEscalateAfter)
+	if nextReset := state.lastRawReset.Add(execNestDerivedResetInterval); nextReset.After(deadline) {
+		deadline = nextReset
+	}
+	remaining := deadline.Sub(now)
+	if remaining < execNestDerivedWarmupCheck {
+		remaining = execNestDerivedWarmupCheck
+	}
+	if remaining < timeout {
+		return remaining
+	}
+	return timeout
+}
+
+func clearExecNestDerivedFailures(inputName string) {
+	execNestDerivedRecovery.Lock()
+	defer execNestDerivedRecovery.Unlock()
+	state := execNestDerivedRecoveryStateLocked(inputName)
+	state.failedSince = time.Time{}
+	state.lastFailure = time.Time{}
+	state.failedAttempts = 0
+	// Retain the reset reservation so a brief recovery cannot cause reset churn.
+}
+
 func execNestShouldClearBackoffAfterDerivedWarmup(failures int) bool {
 	return true
 }
@@ -1653,6 +1738,7 @@ func (p *Producer) stopLocalNestDerivedStale(workerID int, inputName string, sta
 	}
 	wait := p.markExecNestBackoffLocked()
 	failures := p.execNestFailures
+	noteExecNestDerivedStall(inputName, time.Now(), stagnantFor)
 	p.stopLocked()
 	p.setExecNestRecoveryUntilLocked(time.Now().Add(wait))
 	p.mu.Unlock()
@@ -1846,6 +1932,7 @@ func (p *Producer) setExecNestRecoveryUntilLocked(until time.Time) {
 }
 
 func (p *Producer) markLocalNestDerivedReady(inputName, reason string) {
+	clearExecNestDerivedFailures(inputName)
 	p.mu.Lock()
 	failures := p.recentExecNestFailuresLocked(time.Now())
 	hadBackoff := failures > 0 || !p.recoveringUntil.IsZero()
