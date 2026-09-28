@@ -48,8 +48,8 @@ warmup/settle shared history, source isolation, concurrent reset reservation,
 readiness clearing, history expiry, actual settle-path reset requests, probe
 deadline capping, and both observed failure traces using synthetic camera names.
 
-Windows focused tests pass ten repetitions. Linux race checks and build are
-required before install. Full internal/streams still has TestRecursion and
+Windows focused tests and Linux race checks passed ten repetitions. The Linux
+amd64 binary built successfully. Full internal/streams still has TestRecursion and
 TestTempate failures (`streams: source not supported`); both reproduce on an
 unchanged v63 source archive at ec152af. Do not report the full suite as green.
 
@@ -71,3 +71,20 @@ Evaluate longer-run results using finalized recording gaps, not raw counters or
 Generate success alone. Correlate raw_activity_escalation, raw_changed, verified
 media and actual resumed recordings. Keep private logs, camera names and config
 out of public source. Ask the user before reverting production.
+
+## Deployment evidence - September 28, 2026
+
+- Source and release tag b101-v64: a19816c7f8fdce25a3d20043cd34fb052389ca18.
+- Published binary SHA-256 matches the installed file and running process:
+  193e2bb4f6c61bb90c9fc33c527943ae97aad72d8e1d66820beabe9ad75f7625.
+- Frigate restarted at 00:48:28 EDT. Version remains 0.18.0; persistent YAML
+  and Compose files matched their pre-deployment checksums.
+- Startup checks at approximately 49 and 107 seconds showed healthy Frigate,
+  exactly one matching go2rtc process and fresh recordings from all eight cameras.
+- The three Nest sources began recording at approximately 20-22 seconds;
+  sampled finalized files contain 1600x1200 H264 video and AAC audio.
+- No no-frame/read-frame/FFmpeg-crash/invalid-data/media-stall messages were found
+  in those startup checks, and no completed inter-segment gap >=10 seconds was
+  found after the first post-startup recordings.
+- No active-raw escalation has been exercised in these startup checks.
+  This is startup verification, not proof of sustained recovery or stability.
