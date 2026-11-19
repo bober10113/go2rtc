@@ -47,18 +47,31 @@ func (w *WriteBuffer) WriteTo(wr io.Writer) (n int64, err error) {
 }
 
 func (w *WriteBuffer) Close() error {
-	if closer, ok := w.Writer.(io.Closer); ok {
-		return closer.Close()
-	}
+	// I'm not sure that's the best solution. This class needs a complete rewrite.
+	// https://github.com/AlexxIT/go2rtc/pull/2339
 	w.mu.Lock()
+	closer, _ := w.Writer.(io.Closer)
+	if w.err == nil {
+		w.err = io.ErrClosedPipe
+	}
 	w.done()
 	w.mu.Unlock()
+
+	if closer != nil {
+		return closer.Close()
+	}
 	return nil
 }
 
 func (w *WriteBuffer) Reset(wr io.Writer) {
 	w.mu.Lock()
 	w.add()
+	// A disconnect may precede the HTTP handler attaching its writer.
+	if w.err != nil {
+		w.done()
+		w.mu.Unlock()
+		return
+	}
 	if buf, ok := w.Writer.(*bytes.Buffer); ok && buf.Len() != 0 {
 		if _, err := io.Copy(wr, buf); err != nil {
 			w.err = err

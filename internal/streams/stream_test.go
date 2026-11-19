@@ -9,9 +9,12 @@ import (
 )
 
 func TestRecursion(t *testing.T) {
-	// create stream with some source
-	stream1, err := New("from_yaml", "does_not_matter")
-	require.NoError(t, err)
+	oldStreams := streams
+	streams = map[string]*Stream{}
+	t.Cleanup(func() { streams = oldStreams })
+	// Configured sources use NewStream, not the validated dynamic-source API.
+	stream1 := NewStream("does_not_matter")
+	streams["from_yaml"] = stream1
 	require.Len(t, streams, 1)
 
 	// ask another unnamed stream that links go2rtc
@@ -27,12 +30,15 @@ func TestRecursion(t *testing.T) {
 	require.Len(t, streams, 2)
 }
 
-func TestTempate(t *testing.T) {
+func TestTemplate(t *testing.T) {
+	oldStreams, oldHandlers := streams, handlers
+	streams, handlers = map[string]*Stream{}, map[string]Handler{}
+	t.Cleanup(func() { streams, handlers = oldStreams, oldHandlers })
 	HandleFunc("rtsp", func(url string) (core.Producer, error) { return nil, nil }) // bypass HasProducer
 
 	// config from yaml
-	stream1, err := New("camera.from_hass", "ffmpeg:{input}#video=copy")
-	require.NoError(t, err)
+	stream1 := NewStream("ffmpeg:{input}#video=copy")
+	streams["camera.from_hass"] = stream1
 	// request from hass
 	stream2, err := Patch("camera.from_hass", "rtsp://example.com")
 	require.NoError(t, err)

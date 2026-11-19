@@ -1,6 +1,8 @@
 package api
 
 import (
+	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
@@ -210,10 +212,19 @@ func isLoopback(remoteAddr string) bool {
 }
 
 func middlewareAuth(username, password string, localAuth bool, next http.Handler) http.Handler {
+	// We use ConstantTimeCompare and Sum256 to prevent an attacker from guessing the password length.
+	// https://github.com/AlexxIT/go2rtc/pull/2693
+	wantUser := sha256.Sum256([]byte(username))
+	wantPass := sha256.Sum256([]byte(password))
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if localAuth || !isLoopback(r.RemoteAddr) {
 			user, pass, ok := r.BasicAuth()
-			if !ok || user != username || pass != password {
+			gotUser := sha256.Sum256([]byte(user))
+			gotPass := sha256.Sum256([]byte(pass))
+			valid := subtle.ConstantTimeCompare(gotUser[:], wantUser[:]) &
+				subtle.ConstantTimeCompare(gotPass[:], wantPass[:])
+			if !ok || valid != 1 {
 				w.Header().Set("Www-Authenticate", `Basic realm="go2rtc"`)
 				http.Error(w, "Unauthorized", http.StatusUnauthorized)
 				return
