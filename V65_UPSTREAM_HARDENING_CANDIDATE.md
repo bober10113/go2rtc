@@ -60,6 +60,20 @@ security improvement. None proves a fix for wireless packet loss, Google-side
 stalls or all long Nest recording gaps. v64's existing Nest recovery policy stays
 intact; do not claim a new recovery deadline.
 
+## Build receipt
+
+- Source commit: `89d4b065556a5a681828139a9eafe26e7073d6bd`.
+- Linux amd64, Go 1.24.13, CGO disabled, `go build -p=2 -trimpath`.
+- Binary: `go2rtc-b101-v65-candidate-linux-amd64`.
+- SHA-256: `eeac628a1ea0b8677d3ff3f7923f678f1fbcc7ccf2e1ee9e62f373b3c7bff0c6`.
+- Executed only with `-version` in an isolated Linux container:
+  `go2rtc version 1.9.14+dev.89d4b06 (89d4b06) linux/amd64`.
+- The same nine targeted packages also passed 25 shuffled-order repetitions
+  on Windows. Source and local candidate artifact are preserved; no production
+  installation or release-binary publication was performed.
+
+The build receipt is a documentation-only follow-up to the source commit above.
+
 ## Deployment gate
 
 Do not install automatically. Preserve the currently installed binary and config,
