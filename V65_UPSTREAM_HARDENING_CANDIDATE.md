@@ -1,6 +1,8 @@
 # v65 candidate: targeted upstream hardening
 
-Prepared November 18, 2026. Candidate only; production remains on v64.
+Prepared November 18, 2026. Deployed with explicit approval at 22:29:42 EST
+on the same date. Initial recording/playback verification passed; long-term
+stability remains unproven. The candidate-stage notes below are historical.
 Base: v64 source `a19816c` plus documentation commit `650900d`.
 No Nest recovery policy, media codecs, dependency versions or Frigate settings
 are changed. This is reliability/security work, not a measured CPU optimization.
@@ -81,3 +83,19 @@ then use a separately authorized deployment with a single restart. Verify the
 running binary hash, one process, all cameras' fresh finalized recordings and
 live playback. Compare recording gaps and failure markers over a longer window.
 Ask before reverting. Keep private configuration/logs out of the public branch.
+
+## Deployment receipt - November 18, 2026
+
+- Installed the exact source-commit `89d4b06` binary and checksum recorded above.
+- One Frigate restart; Frigate 0.18.3 image, persistent configuration, Compose,
+  command allowlist and container host settings remained unchanged.
+- Backed up the previous binary and deployment files before atomic replacement.
+- Verified one running go2rtc process with the expected v65 checksum.
+- All eight enabled cameras produced finalized recordings within the initial
+  check. All eight recording HLS playlists and media segments loaded; a Nest and
+  non-Nest sample decoded successfully.
+- Planned restart gaps: 22-24 seconds for non-Nest, 36-45 seconds for Nest.
+- No checked startup FFmpeg crash, missing-frame, invalid-data, media-stall,
+  panic, restricted-source or nginx uninitialized-variable errors.
+- Authentication remained enforced. This is initial verification only, not
+  proof of long-term stability or a guarantee about future network outages.
